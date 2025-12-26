@@ -15,9 +15,11 @@ class Paths:
 def get_paths() -> Paths:
     """
     Single source of truth for file paths.
-    Assumes this file is at: repo_root/src/musicrec/config.py
+    Assumes this file is at: <repo_root>/src/musicrec/config.py
     """
-    repo_root = Path(__file__).resolve().parents[3]
+    # config.py -> musicrec -> src -> repo_root
+    repo_root = Path(__file__).resolve().parents[2]
+
     data_raw_dir = repo_root / "data" / "raw"
     data_processed_dir = repo_root / "data" / "processed"
     raw_catalog_csv = data_raw_dir / "spotify_2015_2025_85k.csv"
