@@ -7,7 +7,8 @@ from dataclasses import asdict, is_dataclass
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import List, Any, Dict, Optional, Tuple
+from musicrec.faiss_ann import FaissANN
 
 import numpy as np
 import pandas as pd
@@ -28,9 +29,11 @@ _X_SCALED: Optional[np.ndarray] = None
 _ID_TO_IDX: Optional[Dict[str, int]] = None
 
 _KNN: Any = None
+_ANN: Any = None
 _HYBRID: Any = None
 _PLAYLIST_GEN: Any = None
 _SESSION_STORE: Any = None
+_FAISS_CACHE = None
 
 
 # --------------------------------------------------------------------------------------
@@ -171,6 +174,64 @@ def _load_catalog() -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, Dict[str, int
 # --------------------------------------------------------------------------------------
 # Model singletons
 # --------------------------------------------------------------------------------------
+def _get_faiss_ann():
+    """
+    Returns: (ann, track_ids_array, track_id_to_pos)
+
+    - Loads FAISS index + track_ids if present
+    - If track_ids.npy is an object array (old/unsafe), rebuilds and overwrites safely
+    """
+    global _FAISS_CACHE
+    if _FAISS_CACHE is not None:
+        return _FAISS_CACHE
+
+    from pathlib import Path
+    import numpy as np
+
+    from musicrec.faiss_ann import FaissANN
+
+    ft, X_scaled, _, _ = _load_catalog()
+
+    index_path = Path("data/processed/faiss_cosine_flat.index")
+    track_ids_path = Path("data/processed/faiss_track_ids.npy")
+
+    ft_track_ids = ft["track_id"].astype(str).to_numpy()
+
+    def _safe_string_array(arr: np.ndarray) -> np.ndarray:
+        # Ensure numpy unicode dtype (NOT object)
+        arr = np.asarray(arr, dtype=str)
+        max_len = int(max((len(x) for x in arr.tolist()), default=16))
+        return np.asarray(arr, dtype=f"U{max_len}")
+
+    def _rebuild_and_persist():
+        ann_local = FaissANN.build_flat_cosine(X_scaled)
+        track_ids_local = _safe_string_array(ft_track_ids)
+
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        ann_local.save_flat_cosine(index_path)
+        np.save(track_ids_path, track_ids_local)
+
+        return ann_local, track_ids_local
+
+    if index_path.exists() and track_ids_path.exists():
+        ann = FaissANN.load_flat_cosine(index_path)
+
+        try:
+            track_ids = np.load(track_ids_path, allow_pickle=False)
+        except ValueError:
+            # Old file likely saved as object array -> rebuild safely
+            ann, track_ids = _rebuild_and_persist()
+
+        # If still unsafe dtype or mismatched length, rebuild
+        if getattr(track_ids.dtype, "hasobject", False) or len(track_ids) != len(ft_track_ids):
+            ann, track_ids = _rebuild_and_persist()
+    else:
+        ann, track_ids = _rebuild_and_persist()
+
+    id_to_pos = {str(tid): int(i) for i, tid in enumerate(track_ids.tolist())}
+
+    _FAISS_CACHE = (ann, track_ids, id_to_pos)
+    return _FAISS_CACHE
 
 def _get_knn():
     global _KNN
@@ -618,3 +679,111 @@ def meta() -> Dict[str, Any]:
             "X_scaled_shape": xs_shape,
         },
     }
+
+@app.get("/recommend/ann")
+def recommend_ann(
+    seed_track_id: str,
+    k: int = 10,
+    same_country_only: bool = False,
+    explicit_ok: bool = True,
+    unique_artist: bool = True,
+    debug: bool = False,
+):
+    import numpy as np
+
+    ft, X_scaled, _, id_to_idx = _load_catalog()
+
+    if seed_track_id not in id_to_idx:
+        raise HTTPException(status_code=404, detail=f"track_id not found: {seed_track_id}")
+
+    ann, ann_track_ids, _ = _get_faiss_ann()
+
+    seed_row_idx = int(id_to_idx[seed_track_id])
+    seed_row = ft.iloc[seed_row_idx]
+
+    seed_country = str(seed_row.get("country", "")) if same_country_only else ""
+    seed_artist = str(seed_row.get("artist_name", ""))
+
+    # Use the seed vector from current catalog (query vector doesn't depend on FAISS order)
+    q = X_scaled[seed_row_idx].astype(np.float32, copy=False)
+
+    # retrieve more than k so filters can still return k
+    k_search = int(max(k * 20, 200))
+    scores2D, positions2D = ann.search(q, k_search)
+    scores = scores2D[0]
+    positions = positions2D[0]
+
+    results = []
+    seen_artists = set()
+
+    for score, pos in zip(scores.tolist(), positions.tolist()):
+        if pos < 0:
+            continue
+
+        cand_tid = str(ann_track_ids[int(pos)])
+        if cand_tid == seed_track_id:
+            continue
+
+        cand_row_idx = id_to_idx.get(cand_tid)
+        if cand_row_idx is None:
+            continue
+
+        row = ft.iloc[int(cand_row_idx)]
+
+        # filters
+        if same_country_only:
+            if str(row.get("country", "")) != seed_country:
+                continue
+
+        if not explicit_ok:
+            # If explicit column exists, enforce it; otherwise ignore
+            if "explicit" in ft.columns and bool(row.get("explicit", False)) is True:
+                continue
+
+        if unique_artist:
+            artist = str(row.get("artist_name", ""))
+            if artist in seen_artists:
+                continue
+            seen_artists.add(artist)
+
+        results.append(
+            {
+                "track_id": cand_tid,
+                "score": float(score),
+                "track_name": str(row.get("track_name", "")),
+                "artist_name": str(row.get("artist_name", "")),
+                "country": str(row.get("country", "")),
+                "genre": str(row.get("genre", "")),
+                "popularity": int(row.get("popularity", 0)) if "popularity" in ft.columns else 0,
+                "stream_count": int(row.get("stream_count", 0)) if "stream_count" in ft.columns else 0,
+                "release_date": str(row.get("release_date", "")),
+            }
+        )
+
+        if len(results) >= int(k):
+            break
+
+    payload = {
+        "seed_track_id": seed_track_id,
+        "k": int(k),
+        "returned": len(results),
+        "results": results,
+        "used_ann": True,
+    }
+
+    if debug:
+        payload["debug"] = {
+            "seed_idx": int(seed_row_idx),
+            "seed_track_name": str(seed_row.get("track_name", "")),
+            "seed_artist_name": seed_artist,
+            "available_candidates": int(len(ann_track_ids)),
+            "k_search": int(k_search),
+            "filters": {
+                "same_country_only": bool(same_country_only),
+                "explicit_ok": bool(explicit_ok),
+                "unique_artist": bool(unique_artist),
+                "debug": bool(debug),
+            },
+        }
+
+    return payload
