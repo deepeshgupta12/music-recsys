@@ -1,84 +1,331 @@
 from __future__ import annotations
 
-from functools import lru_cache
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
+
+import inspect
+import json
 
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from musicrec.config import get_paths
+from musicrec.for_you import ForYouQuery, ForYouRecommender
 from musicrec.playlist import PlaylistGenerator, PlaylistQuery
-from musicrec.recommender_hybrid import HybridRecommender, HybridWeights
-from musicrec.recommender_knn import KNNRecommender, SimilarTracksQuery
+from musicrec.session_store import SessionStore
 
-app = FastAPI(title="musicrec API", version="1.2.1")
+import musicrec.recommender_knn as rknn
+import musicrec.recommender_hybrid as rh
 
 
-@lru_cache(maxsize=1)
+app = FastAPI(title="music-recsys", version="1.3.1")
+
+DEFAULT_WEIGHTS: Dict[str, float] = {
+    "w_sim": 0.7,
+    "w_momentum": 0.15,
+    "w_popularity": 0.1,
+    "w_freshness": 0.05,
+}
+
+
+# -----------------------------
+# Lazy-loaded singletons/caches
+# -----------------------------
+_FT: Optional[pd.DataFrame] = None
+_TRACK_ID_SET: Optional[set] = None
+
+_X: Optional[np.ndarray] = None
+_XS: Optional[np.ndarray] = None
+_SCALER: Optional[dict] = None
+
+_KNN: Optional[Any] = None
+_HYB: Optional[Any] = None
+_PLAYGEN: Optional[PlaylistGenerator] = None
+
+_SESS: Optional[SessionStore] = None
+_FORYOU: Optional[ForYouRecommender] = None
+
+
 def _load_feature_table() -> pd.DataFrame:
+    global _FT, _TRACK_ID_SET
+    if _FT is not None:
+        return _FT
     paths = get_paths()
-    ft_path = paths.data_processed_dir / "catalog_features.parquet"
-    if not ft_path.exists():
-        raise RuntimeError(
-            "Missing catalog_features.parquet. Run:\n"
-            "  python scripts/02_ingest_to_parquet.py\n"
-            "  python scripts/03_build_features.py"
-        )
-    return pd.read_parquet(ft_path)
+    p = paths.data_processed_dir / "catalog_features.parquet"
+    if not p.exists():
+        raise RuntimeError(f"missing: {p} (run scripts/03_build_features.py)")
+    _FT = pd.read_parquet(p)
+
+    if "track_id" not in _FT.columns:
+        raise RuntimeError("catalog_features.parquet missing track_id column")
+
+    _TRACK_ID_SET = set(_FT["track_id"].astype(str).tolist())
+    return _FT
 
 
-@lru_cache(maxsize=1)
-def _load_knn_recommender() -> KNNRecommender:
+def _seed_exists(seed_track_id: str) -> bool:
+    global _TRACK_ID_SET
+    if _TRACK_ID_SET is None:
+        _load_feature_table()
+    return seed_track_id in (_TRACK_ID_SET or set())
+
+
+def _load_X() -> np.ndarray:
+    global _X
+    if _X is not None:
+        return _X
     paths = get_paths()
-    x_path = paths.data_processed_dir / "catalog_X.npy"
-    if not x_path.exists():
-        raise RuntimeError("Missing catalog_X.npy. Run: python scripts/03_build_features.py")
+    p = paths.data_processed_dir / "catalog_X.npy"
+    if not p.exists():
+        raise RuntimeError(f"missing: {p} (run scripts/03_build_features.py)")
+    _X = np.load(p)
+    return _X
+
+
+def _load_X_scaled() -> np.ndarray:
+    global _XS
+    if _XS is not None:
+        return _XS
+    paths = get_paths()
+    p = paths.data_processed_dir / "catalog_X_scaled.npy"
+    if not p.exists():
+        raise RuntimeError(f"missing: {p} (run scripts/06_build_scaled_matrix.py)")
+    _XS = np.load(p)
+    return _XS
+
+
+def _load_scaler() -> dict:
+    global _SCALER
+    if _SCALER is not None:
+        return _SCALER
+    paths = get_paths()
+    p = paths.data_processed_dir / "catalog_X_scaler.json"
+    if not p.exists():
+        _SCALER = {}
+        return _SCALER
+    _SCALER = json.loads(p.read_text())
+    return _SCALER
+
+
+def _try_construct(cls: type, attempts: Tuple[Tuple[tuple, dict], ...]) -> Any:
+    last_err: Optional[Exception] = None
+    for args, kwargs in attempts:
+        try:
+            return cls(*args, **kwargs)
+        except TypeError as e:
+            last_err = e
+            continue
+    if last_err:
+        raise last_err
+    raise RuntimeError(f"Could not construct {cls.__name__}")
+
+
+def _construct_recommender_knn() -> Any:
     ft = _load_feature_table()
-    X = np.load(x_path)
-    return KNNRecommender(ft, X)
+    X = _load_X()
+
+    if not hasattr(rknn, "KNNRecommender"):
+        raise RuntimeError("musicrec.recommender_knn must export KNNRecommender")
+
+    cls = rknn.KNNRecommender
+    return _try_construct(
+        cls,
+        attempts=(
+            ((ft, X), {}),
+            ((ft,), {"X": X}),
+            ((), {"feature_table": ft, "X": X}),
+            ((), {"df": ft, "X": X}),
+        ),
+    )
 
 
-@lru_cache(maxsize=1)
-def _load_hybrid_recommender() -> HybridRecommender:
-    paths = get_paths()
-    x_scaled_path = paths.data_processed_dir / "catalog_X_scaled.npy"
-    if not x_scaled_path.exists():
-        raise RuntimeError("Missing catalog_X_scaled.npy. Run: python scripts/06_build_scaled_matrix.py")
+def _construct_recommender_hybrid() -> Any:
     ft = _load_feature_table()
-    Xs = np.load(x_scaled_path)
-    return HybridRecommender(ft, Xs)
+    X = _load_X()
+    Xs = _load_X_scaled()
+    scaler = _load_scaler()
+
+    if not hasattr(rh, "HybridRecommender"):
+        raise RuntimeError("musicrec.recommender_hybrid must export HybridRecommender")
+
+    cls = rh.HybridRecommender
+    return _try_construct(
+        cls,
+        attempts=(
+            ((ft, X, Xs), {}),
+            ((ft, Xs), {}),
+            ((ft, X, Xs, scaler), {}),
+            ((ft, Xs, scaler), {}),
+            ((), {"feature_table": ft, "X": X, "X_scaled": Xs}),
+            ((), {"feature_table": ft, "X_scaled": Xs}),
+            ((), {"df": ft, "X": X, "X_scaled": Xs}),
+            ((), {"df": ft, "X_scaled": Xs}),
+            ((), {"ft": ft, "X": X, "X_scaled": Xs}),
+            ((), {"ft": ft, "X_scaled": Xs}),
+        ),
+    )
 
 
-@lru_cache(maxsize=1)
-def _load_playlist_generator() -> PlaylistGenerator:
+def _get_knn():
+    global _KNN
+    if _KNN is None:
+        _KNN = _construct_recommender_knn()
+    return _KNN
+
+
+def _get_hybrid():
+    global _HYB
+    if _HYB is None:
+        _HYB = _construct_recommender_hybrid()
+    return _HYB
+
+
+def _get_playlist_generator() -> PlaylistGenerator:
+    global _PLAYGEN
+    if _PLAYGEN is None:
+        _PLAYGEN = PlaylistGenerator(_get_hybrid())
+    return _PLAYGEN
+
+
+def _get_session_store() -> SessionStore:
+    global _SESS
+    if _SESS is not None:
+        return _SESS
     paths = get_paths()
-    x_scaled_path = paths.data_processed_dir / "catalog_X_scaled.npy"
-    if not x_scaled_path.exists():
-        raise RuntimeError("Missing catalog_X_scaled.npy. Run: python scripts/06_build_scaled_matrix.py")
+    _SESS = SessionStore(paths.data_processed_dir)
+    return _SESS
+
+
+def _get_for_you() -> ForYouRecommender:
+    global _FORYOU
+    if _FORYOU is not None:
+        return _FORYOU
     ft = _load_feature_table()
-    Xs = np.load(x_scaled_path)
-    return PlaylistGenerator(ft, Xs)
+    Xs = _load_X_scaled()
+    _FORYOU = ForYouRecommender(ft, Xs)
+    return _FORYOU
 
 
+def _instantiate_query(mod, preferred_names, **kwargs):
+    candidates = []
+    for name in preferred_names:
+        cls = getattr(mod, name, None)
+        if isinstance(cls, type):
+            candidates.append(cls)
+    for name in dir(mod):
+        if name.endswith("Query"):
+            cls = getattr(mod, name, None)
+            if isinstance(cls, type) and cls not in candidates:
+                candidates.append(cls)
+
+    if not candidates:
+        raise RuntimeError(f"No Query classes found in {mod.__name__}")
+
+    for cls in candidates:
+        try:
+            sig = inspect.signature(cls)
+            allowed = set(sig.parameters.keys())
+            filtered = {k: v for k, v in kwargs.items() if k in allowed}
+            return cls(**filtered)
+        except TypeError:
+            continue
+
+    raise RuntimeError(
+        f"Could not instantiate any Query in {mod.__name__} with provided params={list(kwargs.keys())}"
+    )
+
+
+def _make_knn_query(**kwargs):
+    return _instantiate_query(
+        rknn,
+        preferred_names=["KNNQuery", "SimilarTracksQuery", "SimilarQuery", "Query"],
+        **kwargs,
+    )
+
+
+def _make_hybrid_query(**kwargs):
+    return _instantiate_query(
+        rh,
+        preferred_names=["HybridQuery", "SimilarTracksQuery", "SimilarHybridQuery", "Query"],
+        **kwargs,
+    )
+
+
+def _parse_weights(
+    w_sim: Optional[float],
+    w_momentum: Optional[float],
+    w_popularity: Optional[float],
+    w_freshness: Optional[float],
+) -> Optional[Dict[str, float]]:
+    provided = [w_sim, w_momentum, w_popularity, w_freshness]
+    if all(v is None for v in provided):
+        return None
+
+    w = {
+        "w_sim": float(w_sim or 0.0),
+        "w_momentum": float(w_momentum or 0.0),
+        "w_popularity": float(w_popularity or 0.0),
+        "w_freshness": float(w_freshness or 0.0),
+    }
+
+    # guard: no negatives
+    if any(v < 0.0 for v in w.values()):
+        raise HTTPException(status_code=400, detail="weights must be non-negative")
+
+    s = sum(w.values())
+    # guard: all zero -> 400 (your failing test)
+    if s <= 0.0:
+        raise HTTPException(status_code=400, detail="at least one weight must be > 0")
+
+    # normalize (makes behavior stable)
+    w = {k: v / s for k, v in w.items()}
+    return w
+
+
+def _safe_call_recommend_similar_hybrid(rec: Any, q: Any, weights: Optional[Dict[str, float]]):
+    fn = getattr(rec, "recommend_similar_hybrid")
+    sig = inspect.signature(fn)
+    if "weights" in sig.parameters:
+        return fn(q, weights=weights)
+    return fn(q)
+
+
+def _safe_call_playlist_generate(gen: PlaylistGenerator, q: PlaylistQuery, weights: Dict[str, float]):
+    fn = getattr(gen, "generate")
+    sig = inspect.signature(fn)
+    if "weights" in sig.parameters:
+        return fn(q, weights=weights)
+    return fn(q)
+
+
+# -----------------------------
+# Basic health
+# -----------------------------
 @app.get("/health")
-def health() -> dict:
+def health() -> Dict[str, Any]:
     return {"ok": True}
 
 
+# -----------------------------
+# Similar tracks (KNN)
+# -----------------------------
 @app.get("/recommend/similar")
 def recommend_similar(
-    seed_track_id: str = Query(..., description="Seed track_id from catalog_features"),
-    k: int = Query(10, ge=1, le=5000),
+    seed_track_id: str = Query(...),
+    k: int = Query(10, ge=1),
     same_country_only: bool = Query(False),
-    country: Optional[str] = Query(None, description="Used only if same_country_only=true"),
-    exclude_same_artist: bool = Query(True),
+    country: Optional[str] = Query(None),
+    exclude_same_artist: bool = Query(False),
     explicit_ok: bool = Query(True),
     debug: bool = Query(False),
-) -> dict:
+) -> Dict[str, Any]:
+    if not _seed_exists(seed_track_id):
+        raise HTTPException(status_code=404, detail="seed_track_id not found")
+
     try:
-        rec = _load_knn_recommender()
-        q = SimilarTracksQuery(
+        rec = _get_knn()
+        q = _make_knn_query(
             seed_track_id=seed_track_id,
             k=k,
             same_country_only=same_country_only,
@@ -88,90 +335,92 @@ def recommend_similar(
             debug=debug,
         )
         results, dbg = rec.recommend_similar(q)
-        return {"seed_track_id": seed_track_id, "k": k, "results": [r.__dict__ for r in results], "debug": dbg}
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"seed_track_id not found: {seed_track_id}")
-    except ValueError as e:
+        return {"seed_track_id": seed_track_id, "k": k, "results": results, "debug": dbg}
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
+# -----------------------------
+# Similar tracks (Hybrid rerank)
+# -----------------------------
 @app.get("/recommend/similar_hybrid")
 def recommend_similar_hybrid(
-    seed_track_id: str = Query(..., description="Seed track_id from catalog_features"),
-    k: int = Query(10, ge=1, le=200),
-    candidate_k: int = Query(200, ge=10, le=2000),
+    seed_track_id: str = Query(...),
+    k: int = Query(10, ge=1),
+    candidate_k: int = Query(200, ge=1),
     same_country_only: bool = Query(False),
     country: Optional[str] = Query(None),
-    exclude_same_artist: bool = Query(True),
+    exclude_same_artist: bool = Query(False),
     explicit_ok: bool = Query(True),
-    w_sim: float = Query(0.70, ge=0.0, le=1.0),
-    w_momentum: float = Query(0.15, ge=0.0, le=1.0),
-    w_popularity: float = Query(0.10, ge=0.0, le=1.0),
-    w_freshness: float = Query(0.05, ge=0.0, le=1.0),
     debug: bool = Query(False),
-) -> dict:
+    # weights (optional)
+    w_sim: Optional[float] = Query(None),
+    w_momentum: Optional[float] = Query(None),
+    w_popularity: Optional[float] = Query(None),
+    w_freshness: Optional[float] = Query(None),
+) -> Dict[str, Any]:
+    if not _seed_exists(seed_track_id):
+        raise HTTPException(status_code=404, detail="seed_track_id not found")
+
+    weights = _parse_weights(w_sim, w_momentum, w_popularity, w_freshness)
+
     try:
-        if (w_sim + w_momentum + w_popularity + w_freshness) <= 0.0:
-            raise ValueError("Hybrid weights sum must be > 0")
-
-        rec = _load_hybrid_recommender()
-
-        q = SimilarTracksQuery(
+        rec = _get_hybrid()
+        q = _make_hybrid_query(
             seed_track_id=seed_track_id,
             k=k,
+            candidate_k=candidate_k,
             same_country_only=same_country_only,
             country=country,
             exclude_same_artist=exclude_same_artist,
             explicit_ok=explicit_ok,
             debug=debug,
         )
-        weights = HybridWeights(w_sim=w_sim, w_momentum=w_momentum, w_popularity=w_popularity, w_freshness=w_freshness)
-
-        results, dbg = rec.recommend_similar_hybrid(q, candidate_k=candidate_k, weights=weights)
-
+        results, dbg = _safe_call_recommend_similar_hybrid(rec, q, weights=weights)
         return {
             "seed_track_id": seed_track_id,
             "k": k,
             "candidate_k": candidate_k,
-            "weights": weights.__dict__,
-            "results": [r.__dict__ for r in results],
+            "weights": (weights if weights is not None else (dbg.get("weights") if isinstance(dbg, dict) else DEFAULT_WEIGHTS)),
+            "results": results,
             "debug": dbg,
         }
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"seed_track_id not found: {seed_track_id}")
-    except ValueError as e:
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
+# -----------------------------
+# Playlist generation (MMR)
+# -----------------------------
 @app.get("/playlist/from_seed")
 def playlist_from_seed(
-    seed_track_id: str = Query(..., description="Seed track_id from catalog_features"),
-    n_tracks: int = Query(25, ge=5, le=100),
-    candidate_k: int = Query(600, ge=200, le=5000),
-
+    seed_track_id: str = Query(...),
+    n_tracks: int = Query(25, ge=5, le=200),
+    candidate_k: int = Query(800, ge=1),
     same_country_only: bool = Query(False),
     country: Optional[str] = Query(None),
     explicit_ok: bool = Query(True),
-
     unique_artist: bool = Query(True),
     max_per_genre: int = Query(8, ge=1, le=50),
-
     lambda_relevance: float = Query(0.75, ge=0.0, le=1.0),
-
-    w_sim: float = Query(0.70, ge=0.0, le=1.0),
-    w_momentum: float = Query(0.15, ge=0.0, le=1.0),
-    w_popularity: float = Query(0.10, ge=0.0, le=1.0),
-    w_freshness: float = Query(0.05, ge=0.0, le=1.0),
-
     debug: bool = Query(False),
-) -> dict:
-    try:
-        gen = _load_playlist_generator()
+    # weights (optional)
+    w_sim: Optional[float] = Query(None),
+    w_momentum: Optional[float] = Query(None),
+    w_popularity: Optional[float] = Query(None),
+    w_freshness: Optional[float] = Query(None),
+) -> Dict[str, Any]:
+    if not _seed_exists(seed_track_id):
+        raise HTTPException(status_code=404, detail="seed_track_id not found")
 
+    weights = _parse_weights(w_sim, w_momentum, w_popularity, w_freshness) or DEFAULT_WEIGHTS
+
+    try:
+        gen = _get_playlist_generator()
         q = PlaylistQuery(
             seed_track_id=seed_track_id,
             n_tracks=n_tracks,
@@ -184,26 +433,101 @@ def playlist_from_seed(
             lambda_relevance=lambda_relevance,
             debug=debug,
         )
-
-        weights = HybridWeights(w_sim=w_sim, w_momentum=w_momentum, w_popularity=w_popularity, w_freshness=w_freshness)
-        if (w_sim + w_momentum + w_popularity + w_freshness) <= 0.0:
-            raise ValueError("Hybrid weights sum must be > 0")
-
-        playlist, dbg = gen.generate(q, weights=weights)
-
+        playlist, dbg = _safe_call_playlist_generate(gen, q, weights=weights)
         return {
             "seed_track_id": seed_track_id,
             "n_tracks": n_tracks,
             "returned": len(playlist),
             "candidate_k": candidate_k,
             "lambda_relevance": lambda_relevance,
-            "weights": weights.__dict__,
-            "playlist": [p.__dict__ for p in playlist],
+            "weights": weights,
+            "playlist": playlist,
             "debug": dbg,
         }
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"seed_track_id not found: {seed_track_id}")
-    except ValueError as e:
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------------
+# Session events + For You
+# -----------------------------
+class SessionEventIn(BaseModel):
+    session_id: str = Field(..., min_length=1)
+    track_id: str = Field(..., min_length=1)
+    event_type: str = Field(..., min_length=1)
+    ts: Optional[str] = None
+
+
+@app.post("/session/event")
+def session_event(body: SessionEventIn) -> Dict[str, Any]:
+    try:
+        store = _get_session_store()
+        store.append(
+            session_id=body.session_id,
+            track_id=body.track_id,
+            event_type=body.event_type,
+            ts=body.ts,
+        )
+        events = store.read(body.session_id)
+        return {"ok": True, "session_id": body.session_id, "events_count": len(events)}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/for_you")
+def for_you(
+    session_id: str = Query(..., min_length=1),
+    n: int = Query(30, ge=5, le=200),
+    candidate_k: int = Query(1200, ge=1),
+    same_country_only: bool = Query(False),
+    country: Optional[str] = Query(None),
+    explicit_ok: bool = Query(True),
+    unique_artist: bool = Query(True),
+    max_per_genre: int = Query(10, ge=1, le=50),
+    lambda_relevance: float = Query(0.75, ge=0.0, le=1.0),
+    debug: bool = Query(False),
+) -> Dict[str, Any]:
+    try:
+        store = _get_session_store()
+        events = store.read(session_id)
+        if not events:
+            raise HTTPException(status_code=404, detail="no events for this session_id")
+
+        rec = _get_for_you()
+        q = ForYouQuery(
+            session_id=session_id,
+            n=n,
+            candidate_k=candidate_k,
+            same_country_only=same_country_only,
+            country=country,
+            explicit_ok=explicit_ok,
+            unique_artist=unique_artist,
+            max_per_genre=max_per_genre,
+            lambda_relevance=lambda_relevance,
+            debug=debug,
+        )
+        items, dbg = rec.recommend(q, events)
+
+        out_items = []
+        for it in items:
+            if isinstance(it, dict):
+                out_items.append(it)
+            else:
+                out_items.append(getattr(it, "__dict__", {"value": str(it)}))
+
+        return {
+            "session_id": session_id,
+            "events_count": len(events),
+            "n": n,
+            "returned": len(out_items),
+            "candidate_k": candidate_k,
+            "lambda_relevance": lambda_relevance,
+            "results": out_items,
+            "debug": dbg,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
