@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -15,31 +15,30 @@ def _safe_str(x: Any) -> str:
 
 class FeedQuery(BaseModel):
     """
-    Query model used by feed_routes.py.
-    Keep this exported symbol stable to avoid import errors.
+    Query model imported by src/musicrec/api/feed_routes.py.
+
+    feed_routes expects:
+      q = FeedQuery(country=..., genre=..., n=..., explicit_ok=..., debug=...)
+      sections, dbg = feeds.home_feed(q)
+      sections, dbg = feeds.genre_feed(q)
     """
     country: str = Field(..., min_length=1)
     genre: Optional[str] = None
-    n: int = Field(default=5, ge=1, le=100)
+    n: int = Field(default=25, ge=1, le=200)
     explicit_ok: bool = True
     debug: bool = False
 
 
 class SegmentFeeds:
     """
-    Segment feed builder (V1.4):
-      - home feed: country-based
-      - genre feed: country + genre-based
+    Segment feeds engine (V1.4).
 
-    Sections:
-      - top: stream_count/popularity
-      - rising: momentum (log1p(stream_count)/(days_since_release+1))
-      - new_releases: recency (lower days_since_release)
-      - instrumental: instrumental-heavy filter
-      - explicit_safe: explicit == 0
+    IMPORTANT: Keep API contract compatible with feed_routes.py:
+      - home_feed(q: FeedQuery) -> (sections: dict, dbg: dict)
+      - genre_feed(q: FeedQuery) -> (sections: dict, dbg: dict)
 
-    Step 1.4.4 (sub-sub-step 1):
-      - Per-section artist de-dup: within each section only.
+    Step 1.4.4: Per-section artist de-dup
+      - De-dup happens WITHIN each section only.
       - Same artist may appear across different sections.
     """
 
@@ -49,44 +48,38 @@ class SegmentFeeds:
         self.ft = feature_table.copy()
 
     # ----------------------------
-    # Public helpers for routes
+    # Public methods used by routes
     # ----------------------------
-    def build(self, q: FeedQuery) -> Dict[str, Any]:
-        if q.genre:
-            return self.genre_feed(country=q.country, genre=q.genre, n=q.n, explicit_ok=q.explicit_ok, debug=q.debug)
-        return self.home_feed(country=q.country, n=q.n, explicit_ok=q.explicit_ok, debug=q.debug)
+    def home_feed(self, q: FeedQuery) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
+        return self._build_sections(
+            country=q.country,
+            genre=None,
+            n=int(q.n),
+            explicit_ok=bool(q.explicit_ok),
+            debug=bool(q.debug),
+        )
 
-    def home_feed(
-        self,
-        country: str,
-        n: int = 5,
-        explicit_ok: bool = True,
-        debug: bool = False,
-    ) -> Dict[str, Any]:
-        return self._build_feed(country=country, genre=None, n=n, explicit_ok=explicit_ok, debug=debug)
-
-    def genre_feed(
-        self,
-        country: str,
-        genre: str,
-        n: int = 5,
-        explicit_ok: bool = True,
-        debug: bool = False,
-    ) -> Dict[str, Any]:
-        return self._build_feed(country=country, genre=genre, n=n, explicit_ok=explicit_ok, debug=debug)
+    def genre_feed(self, q: FeedQuery) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
+        g = (q.genre or "").strip()
+        return self._build_sections(
+            country=q.country,
+            genre=g,
+            n=int(q.n),
+            explicit_ok=bool(q.explicit_ok),
+            debug=bool(q.debug),
+        )
 
     # ----------------------------
-    # Core build
+    # Core builder (returns tuple for feed_routes)
     # ----------------------------
-    def _build_feed(
+    def _build_sections(
         self,
         country: str,
         genre: Optional[str],
         n: int,
         explicit_ok: bool,
         debug: bool,
-    ) -> Dict[str, Any]:
-        # base filter
+    ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
         df = self.ft
         df = df[df["country"].astype(str) == str(country)]
         if genre:
@@ -94,23 +87,17 @@ class SegmentFeeds:
 
         base_rows = int(len(df))
 
-        sections: Dict[str, List[Dict[str, Any]]] = {}
-        sections["top"] = self._top(df, n=n, explicit_ok=explicit_ok)
-        sections["rising"] = self._rising(df, n=n, explicit_ok=explicit_ok)
-        sections["new_releases"] = self._new_releases(df, n=n, explicit_ok=explicit_ok)
-        sections["instrumental"] = self._instrumental(df, n=n, explicit_ok=explicit_ok)
-        sections["explicit_safe"] = self._explicit_safe(df, n=n)
-
-        payload: Dict[str, Any] = {
-            "ok": True,
-            "country": country,
-            "genre": genre,
-            "n": int(n),
-            "sections": sections,
+        sections: Dict[str, List[Dict[str, Any]]] = {
+            "top": self._top(df, n=n, explicit_ok=explicit_ok),
+            "rising": self._rising(df, n=n, explicit_ok=explicit_ok),
+            "new_releases": self._new_releases(df, n=n, explicit_ok=explicit_ok),
+            "instrumental": self._instrumental(df, n=n, explicit_ok=explicit_ok),
+            "explicit_safe": self._explicit_safe(df, n=n),
         }
 
+        dbg: Dict[str, Any] = {}
         if debug:
-            payload["debug"] = {
+            dbg = {
                 "country": country,
                 "genre": genre,
                 "explicit_ok": bool(explicit_ok),
@@ -118,7 +105,7 @@ class SegmentFeeds:
                 "sections_returned": {k: len(v) for k, v in sections.items()},
             }
 
-        return payload
+        return sections, dbg
 
     # ----------------------------
     # Section utilities
@@ -138,10 +125,7 @@ class SegmentFeeds:
 
     def _dedup_by_artist(self, items: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
         """
-        Per-section artist de-dup (Step 1.4.4):
-          - stable, order-preserving
-          - case-insensitive artist_name normalization
-          - if artist missing, fallback to unique by track_id
+        Step 1.4.4: Per-section artist de-dup (order-preserving).
         """
         if n <= 0:
             return []
@@ -159,7 +143,6 @@ class SegmentFeeds:
 
             seen.add(artist)
             out.append(it)
-
             if len(out) >= n:
                 break
 
@@ -173,7 +156,7 @@ class SegmentFeeds:
         return df[df["explicit"].astype(int) == 0]
 
     def _oversample_head(self, df: pd.DataFrame, n: int) -> pd.DataFrame:
-        # oversample so dedup doesn't shrink the section too much
+        # oversample so dedup still yields ~n results
         return df.head(max(n * 5, n))
 
     # ----------------------------
