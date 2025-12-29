@@ -4,7 +4,8 @@ import inspect
 import os
 import json
 from dataclasses import asdict, is_dataclass
-from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version as pkg_version
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -14,6 +15,7 @@ from fastapi import Body, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="music-recsys API", version="1.3.1")
+_STARTED_AT = datetime.now(timezone.utc)
 
 
 # --------------------------------------------------------------------------------------
@@ -462,10 +464,18 @@ def session_event(payload: SessionEventIn = Body(...)) -> Dict[str, Any]:
 
     store = _get_session_store()
     store.append_event(payload.session_id, payload.track_id, payload.event_type)
-    events_count = len(store.get_events(payload.session_id))
+    events_count = store.count_events(payload.session_id)
 
     return {"ok": True, "session_id": payload.session_id, "events_count": events_count}
 
+def _event_track_id(e: Any) -> str:
+    """
+    SessionStore may return SessionEvent objects (preferred) or dicts (legacy).
+    Normalize to a track_id string.
+    """
+    if isinstance(e, dict):
+        return str(e.get("track_id") or "")
+    return str(getattr(e, "track_id", "") or "")
 
 def _for_you_impl(
     session_id: str,
@@ -478,11 +488,20 @@ def _for_you_impl(
     debug: bool = False,
 ) -> Dict[str, Any]:
     store = _get_session_store()
-    events = store.get_events(session_id)
+    events = store.read_events(session_id)
     if not events:
         raise HTTPException(status_code=404, detail=f"No events found for session_id: {session_id}")
 
-    seed_track_id = str(events[-1].get("track_id", ""))
+    seed_track_id = _event_track_id(events[-1])
+    # Defensive fallback: if last event is malformed, walk backwards
+    if not seed_track_id:
+        for ev in reversed(events):
+            seed_track_id = _event_track_id(ev)
+            if seed_track_id:
+                    break
+
+    if not seed_track_id:
+        raise HTTPException(status_code=500, detail="Unable to determine seed_track_id from session events")
 
     hybrid = _get_hybrid()
 
@@ -557,3 +576,49 @@ def for_you_from_session(
         max_per_genre=max_per_genre,
         debug=debug,
     )
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    """Lightweight health check for local dev + CI smoke."""
+    try:
+        pkg_ver = pkg_version("musicrec")
+    except PackageNotFoundError:
+        pkg_ver = "dev"
+
+    now = datetime.now(timezone.utc)
+    uptime_s = (now - _STARTED_AT).total_seconds()
+
+    return {
+        "ok": True,
+        "service": "music-recsys-api",
+        "api_version": getattr(app, "version", "unknown"),
+        "package_version": pkg_ver,
+        "time_utc": now.isoformat(),
+        "uptime_s": round(uptime_s, 3),
+    }
+
+
+@app.get("/meta")
+def meta() -> Dict[str, Any]:
+    """Non-user-facing metadata to help debug local data + index state."""
+    # Reuse whatever loader you already have in main.py
+    ft, X, Xs, id_to_idx = _load_catalog()
+
+    n_tracks = int(len(ft))
+    x_shape = None if X is None else [int(X.shape[0]), int(X.shape[1])]
+    xs_shape = None if Xs is None else [int(Xs.shape[0]), int(Xs.shape[1])]
+
+    # These paths/vars MUST already exist in your working main.py.
+    # If your file uses different constant names, use those existing names.
+    return {
+        "ok": True,
+        "catalog": {
+            "n_tracks": n_tracks,
+            "n_ids": int(len(id_to_idx)),
+            "features_path": str(_FEATURE_TABLE),
+            "X_path": str(_X_FOR_RETRIEVAL) if "CATALOG_X_PATH" in globals() else None,
+            "X_scaled_path": str(_X_SCALED),
+            "X_shape": x_shape,
+            "X_scaled_shape": xs_shape,
+        },
+    }
