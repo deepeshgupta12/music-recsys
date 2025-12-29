@@ -462,10 +462,18 @@ def session_event(payload: SessionEventIn = Body(...)) -> Dict[str, Any]:
 
     store = _get_session_store()
     store.append_event(payload.session_id, payload.track_id, payload.event_type)
-    events_count = len(store.get_events(payload.session_id))
+    events_count = store.count_events(payload.session_id)
 
     return {"ok": True, "session_id": payload.session_id, "events_count": events_count}
 
+def _event_track_id(e: Any) -> str:
+    """
+    SessionStore may return SessionEvent objects (preferred) or dicts (legacy).
+    Normalize to a track_id string.
+    """
+    if isinstance(e, dict):
+        return str(e.get("track_id") or "")
+    return str(getattr(e, "track_id", "") or "")
 
 def _for_you_impl(
     session_id: str,
@@ -478,11 +486,20 @@ def _for_you_impl(
     debug: bool = False,
 ) -> Dict[str, Any]:
     store = _get_session_store()
-    events = store.get_events(session_id)
+    events = store.read_events(session_id)
     if not events:
         raise HTTPException(status_code=404, detail=f"No events found for session_id: {session_id}")
 
-    seed_track_id = str(events[-1].get("track_id", ""))
+    seed_track_id = _event_track_id(events[-1])
+    # Defensive fallback: if last event is malformed, walk backwards
+    if not seed_track_id:
+        for ev in reversed(events):
+            seed_track_id = _event_track_id(ev)
+            if seed_track_id:
+                    break
+
+    if not seed_track_id:
+        raise HTTPException(status_code=500, detail="Unable to determine seed_track_id from session events")
 
     hybrid = _get_hybrid()
 
