@@ -1,49 +1,129 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 import pandas as pd
+from pydantic import BaseModel, Field
 
 
-def _safe_str(x: object) -> str:
+def _safe_str(x: Any) -> str:
     if x is None:
         return ""
     return str(x)
 
 
-@dataclass(frozen=True)
-class FeedSection:
-    name: str
-    items: List[Dict[str, object]]
+class FeedQuery(BaseModel):
+    """
+    Query model used by feed_routes.py.
+    Keep this exported symbol stable to avoid import errors.
+    """
+    country: str = Field(..., min_length=1)
+    genre: Optional[str] = None
+    n: int = Field(default=5, ge=1, le=100)
+    explicit_ok: bool = True
+    debug: bool = False
 
 
 class SegmentFeeds:
     """
-    Build non-personalized segment feeds (V1.4):
-      - /feed/home?country=IN
-      - /feed/genre?country=IN&genre=Pop
+    Segment feed builder (V1.4):
+      - home feed: country-based
+      - genre feed: country + genre-based
 
     Sections:
-      - top: by stream_count/popularity
-      - rising: by momentum (log1p(stream_count)/(days_since_release+1))
-      - new_releases: by recency (lower days_since_release)
-      - instrumental: instrumental-heavy flag
-      - explicit_safe: explicit = 0
+      - top: stream_count/popularity
+      - rising: momentum (log1p(stream_count)/(days_since_release+1))
+      - new_releases: recency (lower days_since_release)
+      - instrumental: instrumental-heavy filter
+      - explicit_safe: explicit == 0
 
-    NOTE (Step 1.4.4):
-      - We deduplicate artists WITHIN EACH SECTION (per-section artist cap = 1),
-        but we allow an artist to appear in multiple sections.
+    Step 1.4.4 (sub-sub-step 1):
+      - Per-section artist de-dup: within each section only.
+      - Same artist may appear across different sections.
     """
 
     def __init__(self, feature_table: pd.DataFrame):
         if "track_id" not in feature_table.columns:
-            raise ValueError("feature_table must include track_id")
-
+            raise ValueError("feature_table must include 'track_id'")
         self.ft = feature_table.copy()
 
-    def _row_to_item(self, row: pd.Series, score: float) -> Dict[str, object]:
+    # ----------------------------
+    # Public helpers for routes
+    # ----------------------------
+    def build(self, q: FeedQuery) -> Dict[str, Any]:
+        if q.genre:
+            return self.genre_feed(country=q.country, genre=q.genre, n=q.n, explicit_ok=q.explicit_ok, debug=q.debug)
+        return self.home_feed(country=q.country, n=q.n, explicit_ok=q.explicit_ok, debug=q.debug)
+
+    def home_feed(
+        self,
+        country: str,
+        n: int = 5,
+        explicit_ok: bool = True,
+        debug: bool = False,
+    ) -> Dict[str, Any]:
+        return self._build_feed(country=country, genre=None, n=n, explicit_ok=explicit_ok, debug=debug)
+
+    def genre_feed(
+        self,
+        country: str,
+        genre: str,
+        n: int = 5,
+        explicit_ok: bool = True,
+        debug: bool = False,
+    ) -> Dict[str, Any]:
+        return self._build_feed(country=country, genre=genre, n=n, explicit_ok=explicit_ok, debug=debug)
+
+    # ----------------------------
+    # Core build
+    # ----------------------------
+    def _build_feed(
+        self,
+        country: str,
+        genre: Optional[str],
+        n: int,
+        explicit_ok: bool,
+        debug: bool,
+    ) -> Dict[str, Any]:
+        # base filter
+        df = self.ft
+        df = df[df["country"].astype(str) == str(country)]
+        if genre:
+            df = df[df["genre"].astype(str) == str(genre)]
+
+        base_rows = int(len(df))
+
+        sections: Dict[str, List[Dict[str, Any]]] = {}
+        sections["top"] = self._top(df, n=n, explicit_ok=explicit_ok)
+        sections["rising"] = self._rising(df, n=n, explicit_ok=explicit_ok)
+        sections["new_releases"] = self._new_releases(df, n=n, explicit_ok=explicit_ok)
+        sections["instrumental"] = self._instrumental(df, n=n, explicit_ok=explicit_ok)
+        sections["explicit_safe"] = self._explicit_safe(df, n=n)
+
+        payload: Dict[str, Any] = {
+            "ok": True,
+            "country": country,
+            "genre": genre,
+            "n": int(n),
+            "sections": sections,
+        }
+
+        if debug:
+            payload["debug"] = {
+                "country": country,
+                "genre": genre,
+                "explicit_ok": bool(explicit_ok),
+                "base_rows": base_rows,
+                "sections_returned": {k: len(v) for k, v in sections.items()},
+            }
+
+        return payload
+
+    # ----------------------------
+    # Section utilities
+    # ----------------------------
+    def _row_to_item(self, row: pd.Series, score: float) -> Dict[str, Any]:
         return {
             "track_id": _safe_str(row.get("track_id")),
             "score": float(score),
@@ -56,18 +136,18 @@ class SegmentFeeds:
             "release_date": _safe_str(row.get("release_date")),
         }
 
-    def _dedup_by_artist(self, items: List[Dict[str, object]], n: int) -> List[Dict[str, object]]:
-        """Deduplicate items by artist_name within a single section.
-
-        - Stable/order-preserving: keeps the first appearance.
-        - Case-insensitive: normalizes artist_name to lower-case.
-        - If artist_name is missing, uses track_id as a fallback unique key.
+    def _dedup_by_artist(self, items: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
+        """
+        Per-section artist de-dup (Step 1.4.4):
+          - stable, order-preserving
+          - case-insensitive artist_name normalization
+          - if artist missing, fallback to unique by track_id
         """
         if n <= 0:
             return []
 
-        seen: set[str] = set()
-        out: List[Dict[str, object]] = []
+        seen: Set[str] = set()
+        out: List[Dict[str, Any]] = []
 
         for it in items:
             artist = _safe_str(it.get("artist_name", "")).strip().lower()
@@ -85,127 +165,90 @@ class SegmentFeeds:
 
         return out
 
-    def home_feed(
-        self,
-        country: str,
-        n: int = 5,
-        genre: Optional[str] = None,
-        explicit_ok: bool = True,
-        debug: bool = False,
-    ) -> Dict[str, object]:
-        if n <= 0:
-            n = 5
+    def _apply_explicit_filter(self, df: pd.DataFrame, explicit_ok: bool) -> pd.DataFrame:
+        if explicit_ok:
+            return df
+        if "explicit" not in df.columns:
+            return df
+        return df[df["explicit"].astype(int) == 0]
 
-        df = self.ft
-        df = df[df["country"].astype(str) == str(country)]
+    def _oversample_head(self, df: pd.DataFrame, n: int) -> pd.DataFrame:
+        # oversample so dedup doesn't shrink the section too much
+        return df.head(max(n * 5, n))
 
-        if genre:
-            df = df[df["genre"].astype(str) == str(genre)]
-
-        base_rows = int(len(df))
-
-        sections: Dict[str, List[Dict[str, object]]] = {}
-        sections["top"] = self._top(df, n=n, explicit_ok=explicit_ok)
-        sections["rising"] = self._rising(df, n=n, explicit_ok=explicit_ok)
-        sections["new_releases"] = self._new_releases(df, n=n, explicit_ok=explicit_ok)
-        sections["instrumental"] = self._instrumental(df, n=n, explicit_ok=explicit_ok)
-        sections["explicit_safe"] = self._explicit_safe(df, n=n)
-
-        payload: Dict[str, object] = {
-            "ok": True,
-            "country": country,
-            "genre": genre,
-            "n": n,
-            "sections": sections,
-        }
-
-        if debug:
-            payload["debug"] = {
-                "country": country,
-                "genre": genre,
-                "explicit_ok": explicit_ok,
-                "base_rows": base_rows,
-                "sections_returned": {k: len(v) for k, v in sections.items()},
-            }
-
-        return payload
-
-    def genre_feed(
-        self,
-        country: str,
-        genre: str,
-        n: int = 5,
-        explicit_ok: bool = True,
-        debug: bool = False,
-    ) -> Dict[str, object]:
-        return self.home_feed(country=country, n=n, genre=genre, explicit_ok=explicit_ok, debug=debug)
-
-    def _top(self, df: pd.DataFrame, n: int, explicit_ok: bool) -> List[Dict[str, object]]:
+    # ----------------------------
+    # Sections
+    # ----------------------------
+    def _top(self, df: pd.DataFrame, n: int, explicit_ok: bool) -> List[Dict[str, Any]]:
         if len(df) == 0:
             return []
 
-        d = df
-        if not explicit_ok and "explicit" in d.columns:
-            d = d[d["explicit"].astype(int) == 0]
+        d = self._apply_explicit_filter(df, explicit_ok)
+        if len(d) == 0:
+            return []
 
-        # oversample then per-section artist dedup
-        d = d.sort_values(["stream_count", "popularity"], ascending=[False, False]).head(max(n * 5, n))
+        d = d.sort_values(["stream_count", "popularity"], ascending=[False, False])
+        d = self._oversample_head(d, n)
 
-        out: List[Dict[str, object]] = []
+        items: List[Dict[str, Any]] = []
         for _, row in d.iterrows():
-            out.append(self._row_to_item(row, score=float(row.get("stream_count", 0))))
-        return self._dedup_by_artist(out, n)
+            items.append(self._row_to_item(row, score=float(row.get("stream_count", 0) or 0)))
+        return self._dedup_by_artist(items, n)
 
-    def _rising(self, df: pd.DataFrame, n: int, explicit_ok: bool) -> List[Dict[str, object]]:
+    def _rising(self, df: pd.DataFrame, n: int, explicit_ok: bool) -> List[Dict[str, Any]]:
         if len(df) == 0:
             return []
 
-        d = df
-        if not explicit_ok and "explicit" in d.columns:
-            d = d[d["explicit"].astype(int) == 0]
+        d = self._apply_explicit_filter(df, explicit_ok)
+        if len(d) == 0:
+            return []
 
         if "momentum" not in d.columns:
-            # fallback compute if not present
             sc = d["stream_count"].fillna(0).astype(float)
-            dsr = d["days_since_release"].fillna(0).astype(float) if "days_since_release" in d.columns else 0.0
+            if "days_since_release" in d.columns:
+                dsr = d["days_since_release"].fillna(0).astype(float)
+            else:
+                dsr = 0.0
             d = d.copy()
             d["momentum"] = np.log1p(sc) / (dsr + 1.0)
 
-        d = d.sort_values(["momentum", "popularity"], ascending=[False, False]).head(max(n * 5, n))
+        d = d.sort_values(["momentum", "popularity"], ascending=[False, False])
+        d = self._oversample_head(d, n)
 
-        out: List[Dict[str, object]] = []
+        items: List[Dict[str, Any]] = []
         for _, row in d.iterrows():
-            out.append(self._row_to_item(row, score=float(row.get("momentum", 0.0))))
-        return self._dedup_by_artist(out, n)
+            items.append(self._row_to_item(row, score=float(row.get("momentum", 0.0) or 0.0)))
+        return self._dedup_by_artist(items, n)
 
-    def _new_releases(self, df: pd.DataFrame, n: int, explicit_ok: bool) -> List[Dict[str, object]]:
+    def _new_releases(self, df: pd.DataFrame, n: int, explicit_ok: bool) -> List[Dict[str, Any]]:
         if len(df) == 0:
             return []
 
-        d = df
-        if not explicit_ok and "explicit" in d.columns:
-            d = d[d["explicit"].astype(int) == 0]
+        d = self._apply_explicit_filter(df, explicit_ok)
+        if len(d) == 0:
+            return []
 
         if "days_since_release" in d.columns:
-            d = d.sort_values(["days_since_release", "popularity"], ascending=[True, False]).head(max(n * 5, n))
+            d = d.sort_values(["days_since_release", "popularity"], ascending=[True, False])
         else:
-            # fallback to release_date if days_since_release missing
-            d = d.sort_values(["release_date", "popularity"], ascending=[False, False]).head(max(n * 5, n))
+            d = d.sort_values(["release_date", "popularity"], ascending=[False, False])
 
-        out: List[Dict[str, object]] = []
+        d = self._oversample_head(d, n)
+
+        items: List[Dict[str, Any]] = []
         for _, row in d.iterrows():
             dsr = float(row.get("days_since_release", 0.0) or 0.0)
             score = 1.0 / (dsr + 1.0)
-            out.append(self._row_to_item(row, score=score))
-        return self._dedup_by_artist(out, n)
+            items.append(self._row_to_item(row, score=score))
+        return self._dedup_by_artist(items, n)
 
-    def _instrumental(self, df: pd.DataFrame, n: int, explicit_ok: bool) -> List[Dict[str, object]]:
+    def _instrumental(self, df: pd.DataFrame, n: int, explicit_ok: bool) -> List[Dict[str, Any]]:
         if len(df) == 0:
             return []
 
-        d = df
-        if not explicit_ok and "explicit" in d.columns:
-            d = d[d["explicit"].astype(int) == 0]
+        d = self._apply_explicit_filter(df, explicit_ok)
+        if len(d) == 0:
+            return []
 
         if "instrumental_heavy" in d.columns:
             d = d[d["instrumental_heavy"].astype(int) == 1]
@@ -215,17 +258,16 @@ class SegmentFeeds:
         if len(d) == 0:
             return []
 
-        d = d.sort_values(["popularity", "stream_count"], ascending=[False, False]).head(max(n * 5, n))
+        d = d.sort_values(["popularity", "stream_count"], ascending=[False, False])
+        d = self._oversample_head(d, n)
 
-        out: List[Dict[str, object]] = []
+        items: List[Dict[str, Any]] = []
         for _, row in d.iterrows():
-            # constant score (we’re filtering by category here)
-            out.append(self._row_to_item(row, score=0.8))
-        return self._dedup_by_artist(out, n)
+            items.append(self._row_to_item(row, score=0.8))
+        return self._dedup_by_artist(items, n)
 
-    def _explicit_safe(self, df: pd.DataFrame, n: int) -> List[Dict[str, object]]:
+    def _explicit_safe(self, df: pd.DataFrame, n: int) -> List[Dict[str, Any]]:
         d = df
         if "explicit" in d.columns:
             d = d[d["explicit"].astype(int) == 0]
-        # reuse _top (already includes per-section artist dedup)
         return self._top(d, n=n, explicit_ok=True)
