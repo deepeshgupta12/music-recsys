@@ -265,7 +265,23 @@ class SessionEventIn(BaseModel):
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    return {"ok": True, "service": "music-recsys", "version": app.version}
+    """Lightweight health check for local dev + CI smoke."""
+    try:
+        pkg_ver = pkg_version("musicrec")
+    except PackageNotFoundError:
+        pkg_ver = "dev"
+
+    now = datetime.now(timezone.utc)
+    uptime_s = (now - _STARTED_AT).total_seconds()
+
+    return {
+        "ok": True,
+        "service": "music-recsys-api",
+        "api_version": getattr(app, "version", "unknown"),
+        "package_version": pkg_ver,
+        "time_utc": now.isoformat(),
+        "uptime_s": round(uptime_s, 3),
+    }
 
 
 # --------------------------------------------------------------------------------------
@@ -576,26 +592,6 @@ def for_you_from_session(
         max_per_genre=max_per_genre,
         debug=debug,
     )
-
-@app.get("/health")
-def health() -> Dict[str, Any]:
-    """Lightweight health check for local dev + CI smoke."""
-    try:
-        pkg_ver = pkg_version("musicrec")
-    except PackageNotFoundError:
-        pkg_ver = "dev"
-
-    now = datetime.now(timezone.utc)
-    uptime_s = (now - _STARTED_AT).total_seconds()
-
-    return {
-        "ok": True,
-        "service": "music-recsys-api",
-        "api_version": getattr(app, "version", "unknown"),
-        "package_version": pkg_ver,
-        "time_utc": now.isoformat(),
-        "uptime_s": round(uptime_s, 3),
-    }
 
 
 @app.get("/meta")
