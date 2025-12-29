@@ -34,7 +34,7 @@ class SimilarTrackResult:
 class KNNRecommender:
     """
     Cosine similarity recommender over a precomputed numeric matrix X.
-    This is our V1 baseline: deterministic, fast enough for 85k.
+    Deterministic baseline.
     """
 
     def __init__(self, feature_table: pd.DataFrame, X: np.ndarray):
@@ -51,7 +51,6 @@ class KNNRecommender:
 
         # Precompute norms for cosine similarity
         self.X_norm = np.linalg.norm(self.X, axis=1)
-        # Avoid division by zero
         self.X_norm[self.X_norm == 0.0] = 1e-12
 
         # Index track_id -> row
@@ -85,8 +84,9 @@ class KNNRecommender:
         return mask
 
     def recommend_similar(self, q: SimilarTracksQuery) -> Tuple[List[SimilarTrackResult], Dict[str, object]]:
-        if q.k <= 0 or q.k > 200:
-            raise ValueError("k must be between 1 and 200")
+        # Updated upper bound: allow larger candidate sets for playlists / diversification
+        if q.k <= 0 or q.k > 5000:
+            raise ValueError("k must be between 1 and 5000")
 
         seed_id = str(q.seed_track_id)
         if seed_id not in self.id_to_idx:
@@ -105,9 +105,13 @@ class KNNRecommender:
         mask = self._filter_mask(seed_idx, q)
         sims_filtered = np.where(mask, sims, -np.inf)
 
+        available = int(np.isfinite(sims_filtered).sum())
+        k = min(q.k, available)
+        if k <= 0:
+            return [], {"available_candidates": available} if q.debug else {}
+
         # Top-k indices
-        k = min(q.k, int(np.isfinite(sims_filtered).sum()))
-        top_idx = np.argpartition(-sims_filtered, kth=min(k, len(sims_filtered)-1))[:k]
+        top_idx = np.argpartition(-sims_filtered, kth=min(k, len(sims_filtered) - 1))[:k]
         top_idx = top_idx[np.argsort(-sims_filtered[top_idx])]
 
         results: List[SimilarTrackResult] = []
@@ -134,7 +138,7 @@ class KNNRecommender:
                 "seed_track_name": str(self.ft.loc[seed_idx].get("track_name", "")),
                 "seed_artist_name": str(self.ft.loc[seed_idx].get("artist_name", "")),
                 "filters": q.__dict__,
-                "available_candidates": int(np.isfinite(sims_filtered).sum()),
+                "available_candidates": available,
             }
 
         return results, debug
