@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import json
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
@@ -229,48 +230,20 @@ def _get_playlist_generator():
 # Session store (local, file-based: avoids mismatch with musicrec.session_store API)
 # --------------------------------------------------------------------------------------
 
-class _FileSessionStore:
-    def __init__(self, base_dir: Path):
-        self.base_dir = Path(base_dir)
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-
-    def _path(self, session_id: str) -> Path:
-        return self.base_dir / f"{session_id}.jsonl"
-
-    def append_event(self, session_id: str, track_id: str, event_type: str) -> None:
-        rec = {
-            "session_id": session_id,
-            "track_id": track_id,
-            "event_type": event_type,
-            "ts": datetime.utcnow().isoformat(),
-        }
-        p = self._path(session_id)
-        with p.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(rec) + "\n")
-
-    def get_events(self, session_id: str) -> list[dict]:
-        p = self._path(session_id)
-        if not p.exists():
-            return []
-        out: list[dict] = []
-        with p.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    out.append(json.loads(line))
-                except Exception:
-                    continue
-        return out
-
 
 def _get_session_store():
     global _SESSION_STORE
     if _SESSION_STORE is not None:
         return _SESSION_STORE
+
+    from musicrec.session_store import SessionStore  # type: ignore
+
+    base_dir = Path(os.environ["MUSICREC_SESSION_DIR"]) if "MUSICREC_SESSION_DIR" in os.environ else (_cache_dir() / "sessions")
+    _SESSION_STORE = SessionStore(base_dir=base_dir)
+    return _SESSION_STORE
+
     base_dir = _cache_dir() / "sessions"
-    _SESSION_STORE = _FileSessionStore(base_dir=base_dir)
+    _SESSION_STORE = SessionStore(base_dir=base_dir)
     return _SESSION_STORE
 
 
