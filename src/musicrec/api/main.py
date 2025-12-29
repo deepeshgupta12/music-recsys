@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Any, Dict, Optional, Tuple
 from musicrec.faiss_ann import FaissANN
+from musicrec.api.feed_routes import router as feed_router
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,7 @@ from fastapi import Body, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="music-recsys API", version="1.3.1")
+app.include_router(feed_router)
 _STARTED_AT = datetime.now(timezone.utc)
 
 
