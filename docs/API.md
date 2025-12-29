@@ -1,104 +1,264 @@
-# Music RecSys API (V1.3.x) — Runbook
+# Music RecSys API (V1)
 
-## Prereqs
-- Python venv activated
-- Required data exists:
-  - data/processed/catalog_features.parquet
-  - (any other artifact files your API loads at startup)
+Base URL (local): `http://127.0.0.1:8000`
 
-## Run locally
-Run from repo root:
+This API provides:
+- Session event capture (play/like)
+- “For You” recommendations from session context
+- Similar tracks (KNN)
+- Hybrid similar tracks (KNN + rerank blend)
+- Playlist generation from a seed (diversified)
 
-uvicorn musicrec.api.main:app --reload --port 8000
+## Conventions
 
-Server: http://127.0.0.1:8000  
-Swagger docs: http://127.0.0.1:8000/docs
+### Track ID
+- `track_id` is a string like `TRK-BEBD53DA84E1`
 
-## Endpoints
+### Boolean query params
+FastAPI accepts booleans as:
+- `true/false` (recommended)
+- Also works with Python bools when using TestClient.
 
-### 1) Similar tracks (KNN)
-GET /recommend/similar
+### Debug
+When `debug=true`, responses include a `debug` object with internal details useful for QA.
 
-Query params:
-- seed_track_id (str)
-- k (int)
-- same_country_only (bool)
-- exclude_same_artist (bool)
-- explicit_ok (bool)
-- debug (bool)
+---
 
-Expected:
-- 200 with list of tracks
-- 404 for invalid seed_track_id
+## POST `/session/event`
 
-### 2) Similar tracks (Hybrid rerank)
-GET /recommend/similar_hybrid
+Record a user event in a session.
 
-Query params:
-- seed_track_id (str)
-- k (int)
-- candidate_k (int)
-- same_country_only (bool)
-- exclude_same_artist (bool)
-- explicit_ok (bool)
-- debug (bool)
+### Body (JSON)
+- `session_id` (string, required)
+- `track_id` (string, required)
+- `event_type` (string, required)  
+  Expected events for V1:
+  - `play`
+  - `like`
 
-Optional weights:
-- w_sim
-- w_momentum
-- w_popularity
-- w_freshness
+### Response (200)
+```json
+{
+  "ok": true,
+  "session_id": "ses-xxx",
+  "events_count": 2
+}
+```
 
-Guard:
-- if all weights are 0 => 400
+### Errors
+- 400: invalid payload (missing fields / bad event type)
+- 500: storage error (SessionStore failure)
 
-### 3) Playlist from seed
-GET /playlist/from_seed
+---
 
-Query params:
-- seed_track_id (str)
-- n_tracks (int)
-- candidate_k (int)
-- same_country_only (bool)
-- unique_artist (bool)
-- max_per_genre (int)
-- explicit_ok (bool)
-- debug (bool)
+## GET `/for_you`
 
-Optional weights:
-- w_sim
-- w_momentum
-- w_popularity
-- w_freshness
+Return recommendations personalized to a session’s events.
 
-Guard:
-- if all weights are 0 => 400
+### Query params
+- `session_id` (string, required)
+- `n` (int, default: 25) — number of tracks to return
+- `candidate_k` (int, default: 1200) — candidate set size used internally
+- `same_country_only` (bool, default: false)
+- `unique_artist` (bool, default: false)
+- `max_per_genre` (int, default: 10)
+- `explicit_ok` (bool, default: true)
+- `debug` (bool, default: false)
 
-### 4) Session events
-POST /session/event
+### Response (200)
+```json
+{
+  "session_id": "ses-xxx",
+  "events_count": 2,
+  "seed_track_id": "TRK-...",
+  "n": 25,
+  "returned": 25,
+  "results": [
+    {
+      "track_id": "TRK-...",
+      "score": 0.91,
+      "track_name": "…",
+      "artist_name": "…",
+      "country": "Brazil",
+      "genre": "Rock",
+      "popularity": 50,
+      "stream_count": 3000,
+      "release_date": "2015-04-02 00:00:00"
+    }
+  ],
+  "debug": {
+    "seed_idx": 0,
+    "seed_track_name": "…",
+    "seed_artist_name": "…",
+    "filters": { "...": "..." },
+    "available_candidates": 8479,
+    "candidate_k": 1200,
+    "weights": {
+      "w_sim": 0.7,
+      "w_momentum": 0.15,
+      "w_popularity": 0.1,
+      "w_freshness": 0.05
+    }
+  }
+}
+```
 
-JSON body:
-- session_id (str)
-- track_id (str)
-- event_type (str: play|like|skip|...)
+### Errors
+- 404: session not found / no events recorded for session (implementation-dependent)
+- 400: invalid params (e.g., candidate_k too small/large, invalid constraints)
+- 500: internal error
 
-Response:
-- ok (bool)
-- events_count (int)
+---
 
-### 5) For You (from session)
-GET /for_you
+## GET `/recommend/similar`
 
-Query params:
-- session_id (str)
-- n (int)
-- candidate_k (int)
-- same_country_only (bool)
-- unique_artist (bool)
-- max_per_genre (int)
-- explicit_ok (bool)
-- debug (bool)
+Return KNN-based similar tracks for a seed.
 
-Expected:
-- 200 with results
-- 404 if session_id not found / no events
+### Query params
+- `seed_track_id` (string, required)
+- `k` (int, default: 5)
+- `same_country_only` (bool, default: false)
+- `country` (string, optional) — if provided, filter to this country
+- `exclude_same_artist` (bool, default: false)
+- `explicit_ok` (bool, default: true)
+- `debug` (bool, default: false)
+
+### Response (200)
+```json
+{
+  "seed_track_id": "TRK-...",
+  "k": 5,
+  "returned": 5,
+  "results": [
+    {
+      "track_id": "TRK-...",
+      "score": 0.96,
+      "track_name": "…",
+      "artist_name": "…",
+      "country": "Brazil",
+      "genre": "Classical",
+      "popularity": 60,
+      "stream_count": 57000,
+      "release_date": "2015-06-11 00:00:00"
+    }
+  ],
+  "debug": {
+    "seed_idx": 0,
+    "seed_track_name": "…",
+    "seed_artist_name": "…",
+    "filters": { "...": "..." },
+    "available_candidates": 8479
+  }
+}
+```
+
+### Errors
+- 404: seed_track_id not found
+- 400: invalid k / invalid constraints
+
+---
+
+## GET `/recommend/similar_hybrid`
+
+Return similar tracks using:
+1) KNN retrieval
+2) weighted rerank over multiple signals
+
+### Query params
+All params from `/recommend/similar`, plus:
+- `candidate_k` (int, default: 200) — candidate pool for hybrid rerank
+- `w_sim` (float, default: 0.7)
+- `w_momentum` (float, default: 0.15)
+- `w_popularity` (float, default: 0.1)
+- `w_freshness` (float, default: 0.05)
+
+### Weight guard
+At least one weight must be > 0 (sum must be > 0). Otherwise API returns 400.
+
+### Response (200)
+```json
+{
+  "seed_track_id": "TRK-...",
+  "k": 5,
+  "candidate_k": 200,
+  "returned": 5,
+  "weights": {
+    "w_sim": 0.7,
+    "w_momentum": 0.15,
+    "w_popularity": 0.1,
+    "w_freshness": 0.05
+  },
+  "results": [ { "...": "..." } ],
+  "debug": {
+    "available_candidates": 8479,
+    "candidate_k": 200,
+    "weights": { "...": "..." },
+    "hybrid_top_scores": [0.77, 0.63, 0.59]
+  }
+}
+```
+
+### Errors
+- 404: seed_track_id not found
+- 400: invalid candidate_k (too small / too large), invalid weights
+
+---
+
+## GET `/playlist/from_seed`
+
+Generate a diversified playlist from a seed.
+
+### Query params
+- `seed_track_id` (string, required)
+- `n_tracks` (int, default: 25)
+- `candidate_k` (int, default: 800)
+- `same_country_only` (bool, default: false)
+- `unique_artist` (bool, default: false)
+- `max_per_genre` (int, default: 8)
+- `explicit_ok` (bool, default: true)
+- `debug` (bool, default: false)
+
+Hybrid weights (same as `/recommend/similar_hybrid`):
+- `w_sim`, `w_momentum`, `w_popularity`, `w_freshness` (defaults as above)
+
+### Response (200)
+```json
+{
+  "seed_track_id": "TRK-...",
+  "n_tracks": 25,
+  "candidate_k": 800,
+  "returned": 25,
+  "weights": { "...": "..." },
+  "playlist": [
+    {
+      "track_id": "TRK-...",
+      "track_name": "…",
+      "artist_name": "…",
+      "genre": "…",
+      "country": "…",
+      "popularity": 60,
+      "stream_count": 57000,
+      "release_date": "2015-06-11 00:00:00",
+      "relevance_score": 1.0,
+      "redundancy_penalty": 0.96,
+      "mmr_score": 0.50
+    }
+  ],
+  "debug": {
+    "requested_n": 25,
+    "returned_n": 25,
+    "candidate_k": 800,
+    "lambda_relevance": 0.75,
+    "unique_artist": true,
+    "max_per_genre": 8,
+    "genre_counts": {
+      "Rock": 5,
+      "Classical": 3
+    }
+  }
+}
+```
+
+### Errors
+- 404: seed_track_id not found
+- 400: invalid candidate_k / invalid weights / invalid constraints
