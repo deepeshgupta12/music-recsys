@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from musicrec.ann_faiss import FaissANN
+from musicrec.faiss_ann import FaissANN
 
 
 def main() -> None:

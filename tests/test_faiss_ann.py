@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from musicrec.ann_faiss import FaissANN
+from musicrec.faiss_ann import FaissANN
 
 
 def test_faiss_flat_cosine_self_neighbor():
