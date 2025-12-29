@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
-
 import inspect
 import json
 
@@ -28,7 +27,6 @@ DEFAULT_WEIGHTS: Dict[str, float] = {
     "w_freshness": 0.05,
 }
 
-
 # -----------------------------
 # Lazy-loaded singletons/caches
 # -----------------------------
@@ -41,10 +39,36 @@ _SCALER: Optional[dict] = None
 
 _KNN: Optional[Any] = None
 _HYB: Optional[Any] = None
-_PLAYGEN: Optional[PlaylistGenerator] = None
+_PLAYGEN: Optional[Any] = None
 
 _SESS: Optional[SessionStore] = None
 _FORYOU: Optional[ForYouRecommender] = None
+
+
+class HybridQueryShim:
+    """
+    A small duck-typed query object for HybridRecommender.
+
+    Why: the Query class inside musicrec.recommender_hybrid is immutable
+    (so we cannot set candidate_k after construction). This shim avoids mutation
+    and provides common pydantic-like helpers used in debug.
+    """
+
+    def __init__(self, **kwargs: Any):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    def dict(self) -> Dict[str, Any]:
+        return dict(self.__dict__)
+
+    def model_dump(self) -> Dict[str, Any]:
+        return dict(self.__dict__)
+
+    def copy(self, update: Optional[Dict[str, Any]] = None) -> "HybridQueryShim":
+        data = dict(self.__dict__)
+        if update:
+            data.update(update)
+        return HybridQueryShim(**data)
 
 
 def _load_feature_table() -> pd.DataFrame:
@@ -140,7 +164,7 @@ def _construct_recommender_knn() -> Any:
     )
 
 
-def _construct_recommender_hybrid() -> Any:
+def _construct_recommender_hybrid(knn: Any) -> Any:
     ft = _load_feature_table()
     X = _load_X()
     Xs = _load_X_scaled()
@@ -150,19 +174,53 @@ def _construct_recommender_hybrid() -> Any:
         raise RuntimeError("musicrec.recommender_hybrid must export HybridRecommender")
 
     cls = rh.HybridRecommender
+
+    attempts = (
+        ((knn, ft, Xs), {}),
+        ((knn, ft, X, Xs), {}),
+        ((knn, ft, Xs, scaler), {}),
+        ((knn, ft, X, Xs, scaler), {}),
+        ((), {"knn": knn, "feature_table": ft, "X_scaled": Xs}),
+        ((), {"knn": knn, "df": ft, "X_scaled": Xs}),
+        ((), {"knn": knn, "feature_table": ft, "X": X, "X_scaled": Xs}),
+        ((), {"knn": knn, "df": ft, "X": X, "X_scaled": Xs}),
+        # fallback: hybrid builds knn internally
+        ((ft, Xs), {}),
+        ((ft, X, Xs), {}),
+        ((ft, Xs, scaler), {}),
+        ((ft, X, Xs, scaler), {}),
+        ((), {"feature_table": ft, "X_scaled": Xs}),
+        ((), {"df": ft, "X_scaled": Xs}),
+        ((), {"feature_table": ft, "X": X, "X_scaled": Xs}),
+        ((), {"df": ft, "X": X, "X_scaled": Xs}),
+    )
+
+    hyb = _try_construct(cls, attempts=attempts)
+
+    # guarantee: hybrid must have knn set for candidate retrieval
+    if not hasattr(hyb, "knn") or getattr(hyb, "knn") is None:
+        try:
+            setattr(hyb, "knn", knn)
+        except Exception:
+            pass
+
+    return hyb
+
+
+def _construct_playlist_generator(hybrid: Any) -> Any:
+    ft = _load_feature_table()
+    Xs = _load_X_scaled()
+
+    cls = PlaylistGenerator
     return _try_construct(
         cls,
         attempts=(
-            ((ft, X, Xs), {}),
-            ((ft, Xs), {}),
-            ((ft, X, Xs, scaler), {}),
-            ((ft, Xs, scaler), {}),
-            ((), {"feature_table": ft, "X": X, "X_scaled": Xs}),
-            ((), {"feature_table": ft, "X_scaled": Xs}),
-            ((), {"df": ft, "X": X, "X_scaled": Xs}),
-            ((), {"df": ft, "X_scaled": Xs}),
-            ((), {"ft": ft, "X": X, "X_scaled": Xs}),
-            ((), {"ft": ft, "X_scaled": Xs}),
+            ((hybrid, Xs), {}),
+            ((hybrid, ft, Xs), {}),
+            ((), {"hybrid": hybrid, "X_scaled": Xs}),
+            ((), {"hybrid": hybrid, "df": ft, "X_scaled": Xs}),
+            ((), {"recommender": hybrid, "X_scaled": Xs}),
+            ((), {"recommender": hybrid, "df": ft, "X_scaled": Xs}),
         ),
     )
 
@@ -177,14 +235,15 @@ def _get_knn():
 def _get_hybrid():
     global _HYB
     if _HYB is None:
-        _HYB = _construct_recommender_hybrid()
+        knn = _get_knn()
+        _HYB = _construct_recommender_hybrid(knn)
     return _HYB
 
 
-def _get_playlist_generator() -> PlaylistGenerator:
+def _get_playlist_generator():
     global _PLAYGEN
     if _PLAYGEN is None:
-        _PLAYGEN = PlaylistGenerator(_get_hybrid())
+        _PLAYGEN = _construct_playlist_generator(_get_hybrid())
     return _PLAYGEN
 
 
@@ -222,17 +281,18 @@ def _instantiate_query(mod, preferred_names, **kwargs):
     if not candidates:
         raise RuntimeError(f"No Query classes found in {mod.__name__}")
 
+    last = None
     for cls in candidates:
         try:
             sig = inspect.signature(cls)
             allowed = set(sig.parameters.keys())
             filtered = {k: v for k, v in kwargs.items() if k in allowed}
             return cls(**filtered)
-        except TypeError:
+        except TypeError as e:
+            last = e
             continue
-
     raise RuntimeError(
-        f"Could not instantiate any Query in {mod.__name__} with provided params={list(kwargs.keys())}"
+        f"Could not instantiate any Query in {mod.__name__} with provided params={list(kwargs.keys())}. last={last}"
     )
 
 
@@ -240,14 +300,6 @@ def _make_knn_query(**kwargs):
     return _instantiate_query(
         rknn,
         preferred_names=["KNNQuery", "SimilarTracksQuery", "SimilarQuery", "Query"],
-        **kwargs,
-    )
-
-
-def _make_hybrid_query(**kwargs):
-    return _instantiate_query(
-        rh,
-        preferred_names=["HybridQuery", "SimilarTracksQuery", "SimilarHybridQuery", "Query"],
         **kwargs,
     )
 
@@ -269,18 +321,14 @@ def _parse_weights(
         "w_freshness": float(w_freshness or 0.0),
     }
 
-    # guard: no negatives
     if any(v < 0.0 for v in w.values()):
         raise HTTPException(status_code=400, detail="weights must be non-negative")
 
     s = sum(w.values())
-    # guard: all zero -> 400 (your failing test)
     if s <= 0.0:
         raise HTTPException(status_code=400, detail="at least one weight must be > 0")
 
-    # normalize (makes behavior stable)
-    w = {k: v / s for k, v in w.items()}
-    return w
+    return {k: v / s for k, v in w.items()}
 
 
 def _safe_call_recommend_similar_hybrid(rec: Any, q: Any, weights: Optional[Dict[str, float]]):
@@ -291,7 +339,7 @@ def _safe_call_recommend_similar_hybrid(rec: Any, q: Any, weights: Optional[Dict
     return fn(q)
 
 
-def _safe_call_playlist_generate(gen: PlaylistGenerator, q: PlaylistQuery, weights: Dict[str, float]):
+def _safe_call_playlist_generate(gen: Any, q: Any, weights: Dict[str, float]):
     fn = getattr(gen, "generate")
     sig = inspect.signature(fn)
     if "weights" in sig.parameters:
@@ -299,17 +347,11 @@ def _safe_call_playlist_generate(gen: PlaylistGenerator, q: PlaylistQuery, weigh
     return fn(q)
 
 
-# -----------------------------
-# Basic health
-# -----------------------------
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True}
 
 
-# -----------------------------
-# Similar tracks (KNN)
-# -----------------------------
 @app.get("/recommend/similar")
 def recommend_similar(
     seed_track_id: str = Query(...),
@@ -342,9 +384,6 @@ def recommend_similar(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# -----------------------------
-# Similar tracks (Hybrid rerank)
-# -----------------------------
 @app.get("/recommend/similar_hybrid")
 def recommend_similar_hybrid(
     seed_track_id: str = Query(...),
@@ -355,7 +394,6 @@ def recommend_similar_hybrid(
     exclude_same_artist: bool = Query(False),
     explicit_ok: bool = Query(True),
     debug: bool = Query(False),
-    # weights (optional)
     w_sim: Optional[float] = Query(None),
     w_momentum: Optional[float] = Query(None),
     w_popularity: Optional[float] = Query(None),
@@ -368,7 +406,10 @@ def recommend_similar_hybrid(
 
     try:
         rec = _get_hybrid()
-        q = _make_hybrid_query(
+
+        # IMPORTANT: do NOT use the module's Query if it can't carry candidate_k.
+        # Use shim so we never mutate frozen pydantic models.
+        q = HybridQueryShim(
             seed_track_id=seed_track_id,
             k=k,
             candidate_k=candidate_k,
@@ -378,12 +419,13 @@ def recommend_similar_hybrid(
             explicit_ok=explicit_ok,
             debug=debug,
         )
+
         results, dbg = _safe_call_recommend_similar_hybrid(rec, q, weights=weights)
         return {
             "seed_track_id": seed_track_id,
             "k": k,
             "candidate_k": candidate_k,
-            "weights": (weights if weights is not None else (dbg.get("weights") if isinstance(dbg, dict) else DEFAULT_WEIGHTS)),
+            "weights": (weights if weights is not None else DEFAULT_WEIGHTS),
             "results": results,
             "debug": dbg,
         }
@@ -393,9 +435,6 @@ def recommend_similar_hybrid(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# -----------------------------
-# Playlist generation (MMR)
-# -----------------------------
 @app.get("/playlist/from_seed")
 def playlist_from_seed(
     seed_track_id: str = Query(...),
@@ -408,7 +447,6 @@ def playlist_from_seed(
     max_per_genre: int = Query(8, ge=1, le=50),
     lambda_relevance: float = Query(0.75, ge=0.0, le=1.0),
     debug: bool = Query(False),
-    # weights (optional)
     w_sim: Optional[float] = Query(None),
     w_momentum: Optional[float] = Query(None),
     w_popularity: Optional[float] = Query(None),
@@ -450,9 +488,6 @@ def playlist_from_seed(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# -----------------------------
-# Session events + For You
-# -----------------------------
 class SessionEventIn(BaseModel):
     session_id: str = Field(..., min_length=1)
     track_id: str = Field(..., min_length=1)
