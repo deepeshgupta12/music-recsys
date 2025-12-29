@@ -697,6 +697,7 @@ def recommend_ann(
         raise HTTPException(status_code=404, detail=f"track_id not found: {seed_track_id}")
 
     ann, ann_track_ids, _ = _get_faiss_ann()
+    ann_loaded = ann is not None and ann_track_ids is not None
 
     seed_row_idx = int(id_to_idx[seed_track_id])
     seed_row = ft.iloc[seed_row_idx]
@@ -777,6 +778,7 @@ def recommend_ann(
             "seed_track_name": str(seed_row.get("track_name", "")),
             "seed_artist_name": seed_artist,
             "available_candidates": int(len(ann_track_ids)),
+            "ann_loaded": ann_loaded,
             "k_search": int(k_search),
             "filters": {
                 "same_country_only": bool(same_country_only),
