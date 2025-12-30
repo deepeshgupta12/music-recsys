@@ -1,146 +1,200 @@
 from __future__ import annotations
 
-import os
 import sqlite3
+import threading
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set
-
-
-@dataclass(frozen=True)
-class FeedbackEvent:
-    user_id: str
-    track_id: str
-    event_type: str
-    ts: float
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 
 class FeedbackStore:
     """
-    SQLite-backed feedback store.
+    SQLite-backed feedback/event store.
 
-    Design goals:
-      - Simple, schema-safe init (CREATE TABLE IF NOT EXISTS)
-      - Thread-safe enough for FastAPI TestClient (check_same_thread=False)
-      - Explicit close() because tests expect it
+    Important behavior for tests:
+      - recent_events() returns recent UNIQUE track_ids (most-recent first)
+      - stats_counts() counts UNIQUE track_ids per event_type within the window
     """
 
-    def __init__(self, db_path: str = "data/feedback.sqlite") -> None:
+    VALID_EVENT_TYPES: Set[str] = {"like", "dislike", "skip", "play"}
+
+    def __init__(self, db_path: str):
         self.db_path = db_path
-
-        # Allow ":memory:" and also allow paths without dirs
-        if db_path != ":memory:":
-            d = os.path.dirname(db_path)
-            if d:
-                os.makedirs(d, exist_ok=True)
-
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA synchronous=NORMAL;")
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS feedback_events (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              user_id TEXT NOT NULL,
-              track_id TEXT NOT NULL,
-              event_type TEXT NOT NULL,
-              ts REAL NOT NULL
-            );
-            """
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_feedback_user_ts ON feedback_events(user_id, ts DESC);"
-        )
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_feedback_user_event ON feedback_events(user_id, event_type);"
-        )
-        self._conn.commit()
+        self._conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS feedback_events (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id    TEXT NOT NULL,
+                    track_id   TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    ts         REAL NOT NULL
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_user_ts ON feedback_events(user_id, ts DESC);")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_feedback_user_event_ts ON feedback_events(user_id, event_type, ts DESC);"
+            )
+            self._conn.commit()
 
     def close(self) -> None:
-        """Tests call this in teardown."""
-        try:
-            self._conn.close()
-        except Exception:
-            # no-op close safety
-            pass
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
-    def record_event(
+    # ---------- Writes ----------
+
+    def add_event(
         self,
-        *,
         user_id: str,
         track_id: str,
         event_type: str,
         ts: Optional[float] = None,
     ) -> None:
-        ts_val = float(ts if ts is not None else time.time())
-        self._conn.execute(
-            "INSERT INTO feedback_events (user_id, track_id, event_type, ts) VALUES (?, ?, ?, ?)",
-            (user_id, track_id, event_type, ts_val),
-        )
-        self._conn.commit()
+        u = (user_id or "").strip()
+        t = (track_id or "").strip()
+        e = (event_type or "").strip().lower()
 
-    def recent(self, *, user_id: str, limit: int = 20) -> List[FeedbackEvent]:
-        cur = self._conn.execute(
-            """
-            SELECT user_id, track_id, event_type, ts
-            FROM feedback_events
-            WHERE user_id = ?
-            ORDER BY ts DESC
-            LIMIT ?
-            """,
-            (user_id, int(limit)),
-        )
-        rows = cur.fetchall()
-        return [
-            FeedbackEvent(
-                user_id=str(r[0]),
-                track_id=str(r[1]),
-                event_type=str(r[2]),
-                ts=float(r[3]),
+        if not u:
+            raise ValueError("user_id is required")
+        if not t:
+            raise ValueError("track_id is required")
+        if e not in self.VALID_EVENT_TYPES:
+            raise ValueError(f"invalid event_type: {e}")
+
+        # Respect provided ts (tests rely on this).
+        event_ts = float(ts) if ts is not None else float(time.time())
+
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO feedback_events (user_id, track_id, event_type, ts)
+                VALUES (?, ?, ?, ?)
+                """,
+                (u, t, e, event_ts),
             )
-            for r in rows
-        ]
+            self._conn.commit()
 
-    def stats(self, *, user_id: str, days: int = 7) -> Dict[str, int]:
+    # ---------- Reads ----------
+
+    def recent_events(self, user_id: str, limit: int = 50) -> List[Dict[str, object]]:
         """
-        Returns counts grouped by event_type within last `days`.
-        Note: this intentionally returns only observed keys; API layer can fill zeros.
+        Return recent UNIQUE track_ids (most-recent first).
+        This matches tests that treat "recent" as a recent-track list.
         """
-        cutoff = time.time() - (int(days) * 86400)
-        cur = self._conn.execute(
-            """
-            SELECT event_type, COUNT(1)
-            FROM feedback_events
-            WHERE user_id = ? AND ts >= ?
-            GROUP BY event_type
-            """,
-            (user_id, float(cutoff)),
-        )
-        out: Dict[str, int] = {}
-        for et, n in cur.fetchall():
-            out[str(et)] = int(n)
+        u = (user_id or "").strip()
+        if not u:
+            raise ValueError("user_id is required")
+
+        lim = int(limit)
+        if lim <= 0:
+            lim = 1
+        if lim > 200:
+            lim = 200
+
+        # Fetch more than needed, then dedup by track_id in Python.
+        fetch_lim = min(2000, lim * 20)
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT track_id, event_type, ts
+                FROM feedback_events
+                WHERE user_id = ?
+                ORDER BY ts DESC, id DESC
+                LIMIT ?
+                """,
+                (u, fetch_lim),
+            ).fetchall()
+
+        out: List[Dict[str, object]] = []
+        seen: Set[str] = set()
+
+        for r in rows:
+            tid = str(r["track_id"])
+            if tid in seen:
+                continue
+            seen.add(tid)
+            out.append(
+                {"track_id": tid, "event_type": str(r["event_type"]), "ts": float(r["ts"])}
+            )
+            if len(out) >= lim:
+                break
+
+        return out
+
+    def stats_counts(self, user_id: str, days: int) -> Dict[str, int]:
+        """
+        Count UNIQUE track_ids per event_type within last N days.
+        Tests expect duplicates for same track to not inflate counts.
+        Always includes all keys with zero defaults.
+        """
+        u = (user_id or "").strip()
+        if not u:
+            raise ValueError("user_id is required")
+
+        d = int(days)
+        if d <= 0:
+            d = 1
+        cutoff = float(time.time()) - (d * 86400.0)
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT event_type, COUNT(DISTINCT track_id) AS c
+                FROM feedback_events
+                WHERE user_id = ?
+                  AND ts >= ?
+                GROUP BY event_type
+                """,
+                (u, cutoff),
+            ).fetchall()
+
+        out = {k: 0 for k in self.VALID_EVENT_TYPES}
+        for r in rows:
+            et = str(r["event_type"])
+            out[et] = int(r["c"])
         return out
 
     def suppressed_track_ids(
         self,
-        *,
         user_id: str,
-        within_days: int = 365,
-        event_types: Sequence[str] = ("dislike", "skip"),
+        event_types: Iterable[str] = ("dislike", "skip"),
+        days: int = 365,
     ) -> Set[str]:
-        """
-        Track IDs to suppress in feeds for this user.
-        Default: suppress disliked + skipped tracks.
-        """
-        cutoff = time.time() - (int(within_days) * 86400)
-        placeholders = ",".join(["?"] * len(event_types))
-        params = [user_id, float(cutoff), *list(event_types)]
-        cur = self._conn.execute(
-            f"""
-            SELECT DISTINCT track_id
-            FROM feedback_events
-            WHERE user_id = ? AND ts >= ? AND event_type IN ({placeholders})
-            """,
-            params,
-        )
-        return {str(r[0]) for r in cur.fetchall()}
+        u = (user_id or "").strip()
+        if not u:
+            return set()
+
+        types = [str(x).strip().lower() for x in event_types]
+        types = [x for x in types if x in self.VALID_EVENT_TYPES]
+        if not types:
+            return set()
+
+        cutoff = float(time.time()) - (int(days) * 86400.0)
+
+        placeholders = ",".join("?" for _ in types)
+        params: Tuple[object, ...] = (u, *types, cutoff)
+
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT DISTINCT track_id
+                FROM feedback_events
+                WHERE user_id = ?
+                  AND event_type IN ({placeholders})
+                  AND ts >= ?
+                """,
+                params,
+            ).fetchall()
+
+        return {str(r["track_id"]) for r in rows}
