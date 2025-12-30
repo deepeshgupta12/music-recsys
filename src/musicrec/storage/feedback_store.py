@@ -1,123 +1,200 @@
 from __future__ import annotations
 
-import os
+import json
 import sqlite3
+import threading
 import time
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
 class FeedbackEvent:
     user_id: str
     track_id: str
-    event_type: str  # "play" | "like" | "dislike" | "skip"
-    ts: float        # unix seconds
+    event_type: str
+    ts_utc: float
+    meta: Dict[str, Any]
 
 
 class FeedbackStore:
     """
-    Tiny SQLite-backed event store for V1.5.
-    - Supports anonymous users via user_id (client generated or header-based).
-    - Keeps schema minimal + indexed.
+    SQLite-backed event store for lightweight feedback instrumentation.
+
+    V1.5.1: write feedback events
+    V1.5.3: read-back + basic aggregation for QA/debugging
     """
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str):
         self.db_path = db_path
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self._lock = threading.Lock()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.db_path)
-        con.row_factory = sqlite3.Row
-        return con
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        return conn
 
     def _init_db(self) -> None:
-        con = self._connect()
-        try:
-            con.execute(
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS feedback_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id TEXT NOT NULL,
                     track_id TEXT NOT NULL,
                     event_type TEXT NOT NULL,
-                    ts REAL NOT NULL
+                    ts_utc REAL NOT NULL,
+                    meta_json TEXT NOT NULL
                 );
                 """
             )
-            con.execute(
-                "CREATE INDEX IF NOT EXISTS idx_feedback_user_ts ON feedback_events(user_id, ts DESC);"
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_feedback_user_ts ON feedback_events(user_id, ts_utc DESC);"
             )
-            con.execute(
-                "CREATE INDEX IF NOT EXISTS idx_feedback_user_track ON feedback_events(user_id, track_id);"
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_feedback_ts ON feedback_events(ts_utc DESC);"
             )
-            con.commit()
-        finally:
-            con.close()
-
-    def add_event(self, user_id: str, track_id: str, event_type: str, ts: Optional[float] = None) -> None:
-        if not user_id or not user_id.strip():
-            raise ValueError("user_id is required")
-        if not track_id or not track_id.strip():
-            raise ValueError("track_id is required")
-        et = (event_type or "").strip().lower()
-        if et not in {"play", "like", "dislike", "skip"}:
-            raise ValueError("event_type must be one of: play, like, dislike, skip")
-
-        t = float(ts if ts is not None else time.time())
-
-        con = self._connect()
-        try:
-            con.execute(
-                "INSERT INTO feedback_events(user_id, track_id, event_type, ts) VALUES (?, ?, ?, ?)",
-                (user_id.strip(), track_id.strip(), et, t),
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_feedback_event_type ON feedback_events(event_type);"
             )
-            con.commit()
-        finally:
-            con.close()
 
-    def recent_events(self, user_id: str, limit: int = 100) -> List[FeedbackEvent]:
-        limit = max(1, min(int(limit), 1000))
-        con = self._connect()
-        try:
-            rows = con.execute(
-                """
-                SELECT user_id, track_id, event_type, ts
-                FROM feedback_events
-                WHERE user_id = ?
-                ORDER BY ts DESC
-                LIMIT ?
-                """,
-                (user_id.strip(), limit),
-            ).fetchall()
-            return [
-                FeedbackEvent(
-                    user_id=str(r["user_id"]),
-                    track_id=str(r["track_id"]),
-                    event_type=str(r["event_type"]),
-                    ts=float(r["ts"]),
+    def add_event(
+        self,
+        *,
+        user_id: str,
+        track_id: str,
+        event_type: str,
+        meta: Optional[Dict[str, Any]] = None,
+        ts_utc: Optional[float] = None,
+    ) -> int:
+        meta = meta or {}
+        ts_utc = float(ts_utc if ts_utc is not None else time.time())
+
+        meta_json = json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
+
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    INSERT INTO feedback_events (user_id, track_id, event_type, ts_utc, meta_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (user_id, track_id, event_type, ts_utc, meta_json),
                 )
-                for r in rows
-            ]
-        finally:
-            con.close()
+                return int(cur.lastrowid)
 
-    def counts_by_type(self, user_id: str) -> Dict[str, int]:
-        con = self._connect()
-        try:
-            rows = con.execute(
-                """
-                SELECT event_type, COUNT(1) AS c
-                FROM feedback_events
-                WHERE user_id = ?
-                GROUP BY event_type
-                """,
-                (user_id.strip(),),
-            ).fetchall()
-            out: Dict[str, int] = {"play": 0, "like": 0, "dislike": 0, "skip": 0}
-            for r in rows:
-                out[str(r["event_type"])] = int(r["c"])
-            return out
-        finally:
-            con.close()
+    def recent_events(
+        self,
+        *,
+        limit: int = 50,
+        user_id: Optional[str] = None,
+        event_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Read-back for debugging/QA.
+        Returns newest-first.
+        """
+        limit = int(max(1, min(limit, 500)))
+
+        where: List[str] = []
+        params: List[Any] = []
+        if user_id:
+            where.append("user_id = ?")
+            params.append(user_id)
+        if event_type:
+            where.append("event_type = ?")
+            params.append(event_type)
+
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+
+        sql = (
+            "SELECT id, user_id, track_id, event_type, ts_utc, meta_json "
+            "FROM feedback_events"
+            f"{where_sql} "
+            "ORDER BY ts_utc DESC "
+            "LIMIT ?"
+        )
+        params.append(limit)
+
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(sql, params).fetchall()
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            try:
+                meta = json.loads(r["meta_json"]) if r["meta_json"] else {}
+            except Exception:
+                meta = {}
+            out.append(
+                {
+                    "id": int(r["id"]),
+                    "user_id": str(r["user_id"]),
+                    "track_id": str(r["track_id"]),
+                    "event_type": str(r["event_type"]),
+                    "ts_utc": float(r["ts_utc"]),
+                    "meta": meta,
+                }
+            )
+        return out
+
+    def stats(
+        self,
+        *,
+        window_days: int = 7,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Basic rollup for observability:
+        - count by event_type
+        - total events
+        - unique tracks
+        """
+        window_days = int(max(1, min(window_days, 365)))
+        cutoff = time.time() - (window_days * 86400)
+
+        where: List[str] = ["ts_utc >= ?"]
+        params: List[Any] = [cutoff]
+        if user_id:
+            where.append("user_id = ?")
+            params.append(user_id)
+
+        where_sql = " WHERE " + " AND ".join(where)
+
+        with self._lock:
+            with self._connect() as conn:
+                total = conn.execute(
+                    f"SELECT COUNT(1) AS c FROM feedback_events{where_sql}",
+                    params,
+                ).fetchone()["c"]
+
+                uniq_tracks = conn.execute(
+                    f"SELECT COUNT(DISTINCT track_id) AS c FROM feedback_events{where_sql}",
+                    params,
+                ).fetchone()["c"]
+
+                rows = conn.execute(
+                    f"""
+                    SELECT event_type, COUNT(1) AS c
+                    FROM feedback_events
+                    {where_sql}
+                    GROUP BY event_type
+                    ORDER BY c DESC
+                    """,
+                    params,
+                ).fetchall()
+
+        counts = {str(r["event_type"]): int(r["c"]) for r in rows}
+        return {
+            "window_days": window_days,
+            "cutoff_ts_utc": float(cutoff),
+            "user_id": user_id,
+            "total_events": int(total),
+            "unique_tracks": int(uniq_tracks),
+            "counts_by_event_type": counts,
+        }
