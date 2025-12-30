@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import pandas as pd
@@ -81,7 +81,6 @@ class ForYouRecommender:
 
     @staticmethod
     def _parse_ts(ts: str) -> datetime:
-        # expects ISO; tolerant fallback
         try:
             dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
             if dt.tzinfo is None:
@@ -91,9 +90,6 @@ class ForYouRecommender:
             return datetime.now(timezone.utc)
 
     def build_profile_vector(self, events: List[SessionEvent]) -> Tuple[np.ndarray, Dict[str, object]]:
-        """
-        Weighted average of track vectors based on event weights + recency decay.
-        """
         if not events:
             raise ValueError("No events: cannot build profile")
 
@@ -114,7 +110,7 @@ class ForYouRecommender:
             if base_w == 0.0:
                 continue
 
-            dt = self._parse_ts(e.ts)
+            dt = self._parse_ts(str(e.ts))
             age_days = max(0.0, (now - dt).total_seconds() / 86400.0)
 
             # recency decay: half-life ~ 7 days
@@ -135,7 +131,6 @@ class ForYouRecommender:
         profile = (W[:, None] * V).sum(axis=0)
         norm = float(np.linalg.norm(profile))
         if norm == 0.0:
-            # fallback: small epsilon to avoid NaNs
             profile = profile + 1e-9
             norm = float(np.linalg.norm(profile))
         profile = profile / norm
@@ -148,7 +143,6 @@ class ForYouRecommender:
         return profile, dbg
 
     def _cos_to_profile(self, profile: np.ndarray) -> np.ndarray:
-        # cosine(profile, X_i) = (X_i · profile) / ||X_i|| since ||profile||=1
         dots = self.X @ profile
         return dots / self.norms
 
@@ -190,7 +184,6 @@ class ForYouRecommender:
         seen = {str(e.track_id) for e in events}
         profile, prof_dbg = self.build_profile_vector(events)
 
-        # if same_country_only and no explicit country provided, use the last seen playable track's country as seed_country
         seed_country = None
         if q.same_country_only and q.country is None:
             for e in reversed(events):
@@ -201,7 +194,6 @@ class ForYouRecommender:
 
         sim = self._cos_to_profile(profile)
 
-        # base mask + exclude seen
         mask = self._apply_filters_mask(q, seed_country=seed_country)
         if seen:
             tids = self.ft["track_id"].astype("string").to_numpy()
@@ -209,7 +201,6 @@ class ForYouRecommender:
 
         sim_f = np.where(mask, sim, -np.inf)
 
-        # candidate top-k by similarity
         available = int(np.isfinite(sim_f).sum())
         k = min(q.candidate_k, available)
         if k <= 0:
@@ -218,30 +209,24 @@ class ForYouRecommender:
         cand_idx = np.argpartition(-sim_f, kth=min(k, len(sim_f) - 1))[:k]
         cand_idx = cand_idx[np.argsort(-sim_f[cand_idx])]
 
-        # small additional scoring signals (normalized within candidate set)
         pop = self.ft.loc[cand_idx, "popularity"].to_numpy(dtype="float64")
         sc = self.ft.loc[cand_idx, "stream_count"].to_numpy(dtype="float64")
-        # prefer fresher => invert days_since_release if present
+
         if "days_since_release" in self.ft.columns:
             dsr = self.ft.loc[cand_idx, "days_since_release"].to_numpy(dtype="float64")
-            freshness = 1.0 - self._minmax(dsr)  # higher = fresher
+            freshness = 1.0 - self._minmax(dsr)
         else:
             freshness = np.ones_like(pop) * 0.5
 
         pop_n = self._minmax(pop)
-        # log-scale stream_count then normalize
         sc_n = self._minmax(np.log1p(sc))
-
-        # final relevance score (keep similarity dominant)
         sim_n = self._minmax(sim_f[cand_idx])
         score = 0.80 * sim_n + 0.10 * pop_n + 0.07 * sc_n + 0.03 * freshness
 
-        # MMR selection with constraints
         selected: List[int] = []
         used_artists = set() if q.unique_artist else set()
         genre_counts: Dict[str, int] = {}
 
-        # precompute norms in candidate subset for redundancy calculation
         cand_vectors = self.X[cand_idx]
         cand_norms = self.norms[cand_idx]
 
@@ -255,79 +240,162 @@ class ForYouRecommender:
 
         out: List[ForYouItem] = []
         for _ in range(q.n):
-            best = None  # (mmr, rel, tid)
+            best_mmr = -1e18
             best_pos = None
+            best_rel = None
             best_red = None
 
             for pos in range(len(cand_idx)):
                 if pos in selected:
                     continue
 
-                idx = int(cand_idx[pos])
-                row = self.ft.loc[idx]
+                ridx = int(cand_idx[pos])
+                row = self.ft.iloc[ridx]
 
-                artist = str(row.get("artist_name", ""))
-                genre = str(row.get("genre", ""))
+                artist = str(row.get("artist_name") or "").strip().lower()
+                genre = str(row.get("genre") or "").strip().lower()
 
-                if q.unique_artist and artist in used_artists:
-                    continue
-                if q.max_per_genre and genre_counts.get(genre, 0) >= q.max_per_genre:
-                    continue
+                if q.unique_artist and artist:
+                    if artist in used_artists:
+                        continue
 
-                redundancy = max_sim_to_selected(pos)
-                mmr = q.lambda_relevance * float(score[pos]) - (1.0 - q.lambda_relevance) * float(redundancy)
+                if q.max_per_genre > 0 and genre:
+                    if genre_counts.get(genre, 0) >= q.max_per_genre:
+                        continue
 
-                tid = str(row.get("track_id", ""))
-                key = (mmr, float(score[pos]), tid)
-                if best is None or key > best:
-                    best = key
+                rel = float(score[pos])
+                red = max_sim_to_selected(pos)
+                mmr = q.lambda_relevance * rel - (1.0 - q.lambda_relevance) * red
+
+                if mmr > best_mmr:
+                    best_mmr = mmr
                     best_pos = pos
-                    best_red = redundancy
+                    best_rel = rel
+                    best_red = red
 
             if best_pos is None:
                 break
 
             selected.append(best_pos)
 
-            idx = int(cand_idx[best_pos])
-            row = self.ft.loc[idx]
-            artist = str(row.get("artist_name", ""))
-            genre = str(row.get("genre", ""))
+            ridx = int(cand_idx[best_pos])
+            row = self.ft.iloc[ridx]
 
-            if q.unique_artist:
+            artist = str(row.get("artist_name") or "").strip().lower()
+            genre = str(row.get("genre") or "").strip().lower()
+            if q.unique_artist and artist:
                 used_artists.add(artist)
-            genre_counts[genre] = genre_counts.get(genre, 0) + 1
+            if genre:
+                genre_counts[genre] = genre_counts.get(genre, 0) + 1
 
-            out.append(
-                ForYouItem(
-                    track_id=str(row.get("track_id", "")),
-                    track_name=str(row.get("track_name", "")),
-                    artist_name=artist,
-                    genre=genre,
-                    country=str(row.get("country", "")),
-                    popularity=int(row.get("popularity", 0)),
-                    stream_count=int(row.get("stream_count", 0)),
-                    release_date=str(row.get("release_date", "")),
-                    score=float(score[best_pos]),
-                    sim_to_profile=float(sim_f[idx]),
-                    redundancy_penalty=float(best_red if best_red is not None else 0.0),
-                    mmr_score=float(best[0]),
-                )
+            item = ForYouItem(
+                track_id=str(row.get("track_id")),
+                track_name=str(row.get("track_name")),
+                artist_name=str(row.get("artist_name")),
+                genre=str(row.get("genre")),
+                country=str(row.get("country")),
+                popularity=int(row.get("popularity")) if pd.notna(row.get("popularity")) else 0,
+                stream_count=int(row.get("stream_count")) if pd.notna(row.get("stream_count")) else 0,
+                release_date=str(row.get("release_date")),
+                score=float(best_rel if best_rel is not None else 0.0),
+                sim_to_profile=float(sim_f[ridx]) if np.isfinite(sim_f[ridx]) else 0.0,
+                redundancy_penalty=float(best_red if best_red is not None else 0.0),
+                mmr_score=float(best_mmr),
             )
+            out.append(item)
 
-        debug = {}
+        dbg: Dict[str, object] = {}
         if q.debug:
-            debug = {
-                "session_id": q.session_id,
+            dbg = {
                 "available_candidates": available,
-                "candidate_k": q.candidate_k,
-                "returned": len(out),
-                "lambda_relevance": q.lambda_relevance,
-                "unique_artist": q.unique_artist,
-                "max_per_genre": q.max_per_genre,
-                "seed_country": seed_country,
+                "candidate_k": int(q.candidate_k),
+                "n_requested": int(q.n),
+                "n_returned": int(len(out)),
+                # keep both keys: tests expect profile_debug
                 "profile_debug": prof_dbg,
-                "genre_counts": dict(sorted(genre_counts.items(), key=lambda x: (-x[1], x[0]))),
+                "profile": prof_dbg,
+                "constraints": {
+                    "same_country_only": bool(q.same_country_only),
+                    "country": q.country,
+                    "unique_artist": bool(q.unique_artist),
+                    "max_per_genre": int(q.max_per_genre),
+                },
             }
 
-        return out, debug
+        return out, dbg
+
+
+# ----------------------------
+# Build vectors from feature table (no sklearn)
+# ----------------------------
+
+def _days_since_release_from_release_date(release_date_series: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(release_date_series, errors="coerce", utc=True)
+    now = datetime.now(timezone.utc)
+    days = (now - dt).dt.days
+    return days.fillna(3650).clip(lower=0).astype(int)
+
+
+def build_for_you_recommender_from_feature_table(feature_table: pd.DataFrame) -> ForYouRecommender:
+    """
+    Create a ForYouRecommender using only the existing feature table.
+    Dense matrix:
+      - numeric: popularity, log1p(stream_count), days_since_release, explicit (if present)
+      - one-hot: genre, country
+    Then z-score normalize columns.
+    """
+    ft = feature_table.copy()
+
+    if "track_id" not in ft.columns:
+        raise ValueError("feature_table missing track_id")
+    for col in ["track_name", "artist_name", "genre", "country", "popularity", "stream_count", "release_date"]:
+        if col not in ft.columns:
+            ft[col] = None
+
+    if "days_since_release" not in ft.columns:
+        ft["days_since_release"] = _days_since_release_from_release_date(ft["release_date"])
+
+    popularity = pd.to_numeric(ft["popularity"], errors="coerce").fillna(0.0).astype("float64")
+    stream = pd.to_numeric(ft["stream_count"], errors="coerce").fillna(0.0).astype("float64")
+    days = pd.to_numeric(ft["days_since_release"], errors="coerce").fillna(3650.0).astype("float64")
+
+    explicit = None
+    if "explicit" in ft.columns:
+        explicit = ft["explicit"].fillna(False).astype(bool).astype("float64")
+
+    num = pd.DataFrame(
+        {
+            "popularity": popularity,
+            "log_stream_count": np.log1p(stream),
+            "days_since_release": days,
+        }
+    )
+    if explicit is not None:
+        num["explicit"] = explicit
+
+    genre_oh = pd.get_dummies(ft["genre"].fillna("").astype(str).str.strip().str.lower(), prefix="g", dtype="float64")
+    country_oh = pd.get_dummies(ft["country"].fillna("").astype(str).str.strip(), prefix="c", dtype="float64")
+
+    X_df = pd.concat([num, genre_oh, country_oh], axis=1)
+
+    X = X_df.to_numpy(dtype="float64", copy=True)
+    mu = X.mean(axis=0)
+    sigma = X.std(axis=0)
+    sigma[sigma < 1e-12] = 1.0
+    X_scaled = (X - mu) / sigma
+
+    return ForYouRecommender(ft, X_scaled)
+
+
+def for_you_item_to_api_dict(it: ForYouItem) -> Dict[str, Any]:
+    return {
+        "track_id": it.track_id,
+        "score": float(it.mmr_score),
+        "track_name": it.track_name,
+        "artist_name": it.artist_name,
+        "country": it.country,
+        "genre": it.genre,
+        "popularity": int(it.popularity),
+        "stream_count": int(it.stream_count),
+        "release_date": it.release_date,
+    }
