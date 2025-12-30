@@ -1,234 +1,232 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 
-# Positive-only signals for reorder-only personalization
-_EVENT_WEIGHT_POSITIVE: Dict[str, float] = {
-    "play": 1.0,
-    "like": 3.0,
-    "add_to_playlist": 4.0,
-}
-
-# Negative signals are NOT handled here (suppression is handled elsewhere)
-_NEGATIVE_EVENT_TYPES = {"dislike", "skip"}
+__all__ = [
+    "PersonalizationConfig",
+    "reorder_section_reorder_only",
+    "apply_reorder_only_personalization",
+    "reorder_only_personalize_sections",
+]
 
 
 @dataclass(frozen=True)
 class PersonalizationConfig:
-    half_life_days: float = 7.0
-    max_events: int = 500
-
-    # How strongly we let boosts influence order.
-    # We do NOT change scores in the payload; we only reorder by (boost, score, original_index).
-    boost_rank_weight: float = 1.0
-
-    # When true, only consider positive events for boosts
-    positive_only: bool = True
-
-
-def _parse_ts_iso(ts: str) -> datetime:
     """
-    Parse ISO timestamp and ensure tz-aware UTC.
-    Accepts strings like:
-      - 2025-12-30T08:48:21+00:00
-      - 2025-12-30T08:48:21.123456+00:00
-      - 2025-12-30T08:48:21Z  (normalize 'Z' -> '+00:00')
+    V1.5.6 Step 1.4: Reorder-only personalization
+
+    - Never add/remove items from a rail
+    - Only reorder items inside rails
+    - Uses recent feedback events to create per-track boosts
     """
-    s = (ts or "").strip()
-    if not s:
-        return datetime.now(timezone.utc)
-    s = s.replace("Z", "+00:00")
+
+    # Item field names
+    track_id_key: str = "track_id"
+    score_key: str = "score"
+
+    # Boost weights derived from feedback events
+    like_boost: float = 5.0
+    play_boost: float = 2.0
+
+    # Which rails to apply reorder to (default: typical home rails)
+    # NOTE: we intentionally do NOT reorder "for_you" here.
+    default_section_names: Tuple[str, ...] = ("top", "rising", "new_releases", "instrumental", "explicit_safe")
+
+    # Stable ordering for ties
+    stable: bool = True
+
+
+def _safe_track_id(it: Any, track_id_key: str) -> str:
+    if isinstance(it, dict):
+        v = it.get(track_id_key)
+        return "" if v is None else str(v).strip()
+    return ""
+
+
+def _safe_score(it: Any, score_key: str) -> float:
+    if not isinstance(it, dict):
+        return 0.0
+    v = it.get(score_key, 0.0)
     try:
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        return float(v)
     except Exception:
-        return datetime.now(timezone.utc)
-
-
-def build_track_boosts_from_events(
-    events: Iterable[Any],
-    *,
-    cfg: Optional[PersonalizationConfig] = None,
-    now: Optional[datetime] = None,
-) -> Tuple[Dict[str, float], Dict[str, Any]]:
-    """
-    Convert recent feedback events into per-track boost weights with recency decay.
-
-    Expected event shape: either dict-like with keys:
-      - track_id
-      - event_type
-      - ts (ISO string)
-    or an object with attrs:
-      - track_id
-      - event_type
-      - ts
-
-    Returns: (track_boosts, debug)
-    """
-    cfg = cfg or PersonalizationConfig()
-    now = now or datetime.now(timezone.utc)
-
-    boosts: Dict[str, float] = {}
-    considered = 0
-    used = 0
-    skipped_negative = 0
-    skipped_invalid = 0
-
-    for e in list(events)[: cfg.max_events]:
-        considered += 1
-
-        # tolerate dicts or objects
-        if isinstance(e, dict):
-            tid = str((e.get("track_id") or "")).strip()
-            et = str((e.get("event_type") or "")).strip().lower()
-            ts = str((e.get("ts") or "")).strip()
-        else:
-            tid = str(getattr(e, "track_id", "") or "").strip()
-            et = str(getattr(e, "event_type", "") or "").strip().lower()
-            ts = str(getattr(e, "ts", "") or "").strip()
-
-        if not tid or not et:
-            skipped_invalid += 1
-            continue
-
-        if et in _NEGATIVE_EVENT_TYPES and cfg.positive_only:
-            skipped_negative += 1
-            continue
-
-        w0 = _EVENT_WEIGHT_POSITIVE.get(et, 0.0)
-        if w0 <= 0.0:
-            skipped_invalid += 1
-            continue
-
-        dt = _parse_ts_iso(ts)
-        age_days = max(0.0, (now - dt).total_seconds() / 86400.0)
-        decay = 0.5 ** (age_days / float(cfg.half_life_days)) if cfg.half_life_days > 0 else 1.0
-        w = float(w0) * float(decay)
-
-        boosts[tid] = boosts.get(tid, 0.0) + w
-        used += 1
-
-    dbg = {
-        "events_considered": int(considered),
-        "events_used_for_boosts": int(used),
-        "events_skipped_negative": int(skipped_negative),
-        "events_skipped_invalid": int(skipped_invalid),
-        "boosted_track_ids_n": int(len(boosts)),
-    }
-    return boosts, dbg
-
-
-def _minmax_dict(d: Mapping[str, float]) -> Dict[str, float]:
-    if not d:
-        return {}
-    vals = np.array(list(d.values()), dtype="float64")
-    mn = float(np.min(vals))
-    mx = float(np.max(vals))
-    if abs(mx - mn) < 1e-12:
-        return {k: 0.5 for k in d.keys()}
-    return {k: float((v - mn) / (mx - mn)) for k, v in d.items()}
+        return 0.0
 
 
 def reorder_section_reorder_only(
-    items: List[Dict[str, Any]],
+    items: List[Any],
     *,
-    track_boosts: Mapping[str, float],
+    track_boosts: Optional[Dict[str, float]] = None,
     cfg: Optional[PersonalizationConfig] = None,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+) -> Tuple[List[Any], Dict[str, Any]]:
     """
-    Reorder-only:
-      - keeps same items
-      - returns a new list with boosted items earlier (stable)
+    Reorder a single rail using track_boosts.
 
-    Sort key:
-      - boost_norm desc
-      - item["score"] desc (fallback 0.0)
-      - original_index asc
+    Tests expect:
+      - Accepts keyword 'track_boosts'
+      - Returns dbg containing 'boosted_items' and 'moved'
+      - When no boosts, list remains unchanged
     """
     cfg = cfg or PersonalizationConfig()
-    if not items:
-        return items, {"boosted_items": 0, "moved": 0}
+    boosts = track_boosts or {}
 
-    boost_norm = _minmax_dict(track_boosts)
+    dbg: Dict[str, Any] = {
+        "boosted_items": 0,
+        "applied": False,
+        "moved": 0,
+    }
 
-    orig_ids = [str(it.get("track_id") or "") for it in items]
-    idx_by_id = {tid: i for i, tid in enumerate(orig_ids)}
+    if not isinstance(items, list) or len(items) <= 1:
+        return items, dbg
 
-    def score_of(it: Dict[str, Any]) -> float:
-        s = it.get("score")
-        try:
-            return float(s)
-        except Exception:
-            return 0.0
+    # Count boosted items present in this section
+    if boosts:
+        present_ids = [_safe_track_id(x, cfg.track_id_key) for x in items]
+        dbg["boosted_items"] = sum(1 for tid in present_ids if tid and float(boosts.get(tid, 0.0)) != 0.0)
+    else:
+        dbg["boosted_items"] = 0
+        return items, dbg  # stable when no boosts
 
-    decorated = []
-    boosted_items = 0
-    for i, it in enumerate(items):
-        tid = str(it.get("track_id") or "").strip()
-        b = float(boost_norm.get(tid, 0.0)) * float(cfg.boost_rank_weight)
-        if b > 0.0:
-            boosted_items += 1
-        decorated.append((it, b, score_of(it), i))
+    # If nothing in this rail is boosted, return unchanged
+    if dbg["boosted_items"] == 0:
+        return items, dbg
 
-    decorated.sort(key=lambda t: (-t[1], -t[2], t[3]))
-    out = [t[0] for t in decorated]
+    # Score = base_score + boost, ties stable by original index
+    scored: List[Tuple[float, int, Any]] = []
+    for idx, it in enumerate(items):
+        tid = _safe_track_id(it, cfg.track_id_key)
+        base = _safe_score(it, cfg.score_key)
+        boost = 0.0
+        if tid:
+            try:
+                boost = float(boosts.get(tid, 0.0))
+            except Exception:
+                boost = 0.0
+        scored.append((base + boost, idx, it))
 
-    # moved count (how many positions changed)
-    moved = 0
-    for new_i, it in enumerate(out):
-        tid = str(it.get("track_id") or "")
-        old_i = idx_by_id.get(tid, new_i)
-        if old_i != new_i:
-            moved += 1
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    out = [t[2] for t in scored]
 
-    dbg = {"boosted_items": int(boosted_items), "moved": int(moved)}
+    before_ids = [_safe_track_id(x, cfg.track_id_key) for x in items]
+    after_ids = [_safe_track_id(x, cfg.track_id_key) for x in out]
+
+    dbg["applied"] = bool(before_ids != after_ids)
+    dbg["moved"] = sum(1 for i, (b, a) in enumerate(zip(before_ids, after_ids)) if b != a)
+
     return out, dbg
 
 
 def apply_reorder_only_personalization(
-    sections: Dict[str, List[Dict[str, Any]]],
+    sections: Dict[str, list],
     *,
-    track_boosts: Mapping[str, float],
+    track_boosts: Optional[Dict[str, float]] = None,
     section_names: Optional[List[str]] = None,
     cfg: Optional[PersonalizationConfig] = None,
-) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
+) -> Tuple[Dict[str, list], Dict[str, Any]]:
     """
-    Apply reorder-only personalization to selected sections.
-    Keeps section lengths exactly the same.
+    Apply reorder-only personalization across multiple rails.
 
-    Returns (new_sections, debug)
+    Tests expect dbg contains:
+      dbg["personalization_reorder_only_length_deltas"][section_name] == 0
     """
     cfg = cfg or PersonalizationConfig()
-    section_names = section_names or list(sections.keys())
+    boosts = track_boosts or {}
 
-    out: Dict[str, List[Dict[str, Any]]] = {}
-    per_section_dbg: Dict[str, Any] = {}
+    out: Dict[str, list] = dict(sections) if isinstance(sections, dict) else sections
+
+    # default rails if not provided
+    if section_names is None:
+        section_names = [s for s in cfg.default_section_names if isinstance(out.get(s), list)]
+
     length_deltas: Dict[str, int] = {}
+    per_section_dbg: Dict[str, Any] = {}
 
-    for name, items in sections.items():
-        if name not in section_names:
-            out[name] = items
+    for name in section_names:
+        items = out.get(name)
+        if not isinstance(items, list):
             continue
 
         before_n = len(items)
-        new_items, sdbg = reorder_section_reorder_only(items, track_boosts=track_boosts, cfg=cfg)
-        after_n = len(new_items)
+        reordered, sdbg = reorder_section_reorder_only(items, track_boosts=boosts, cfg=cfg)
+        out[name] = reordered
+        after_n = len(reordered)
 
-        out[name] = new_items
-        per_section_dbg[name] = sdbg
         length_deltas[name] = int(after_n - before_n)
+        per_section_dbg[name] = sdbg
 
-    dbg = {
-        "reorder_sections": section_names,
+    dbg: Dict[str, Any] = {
         "personalization_reorder_only_length_deltas": length_deltas,
-        "reorder_debug_by_section": per_section_dbg,
+        "personalization_reorder_only_per_section": per_section_dbg,
+        "personalization_reorder_only_sections": list(section_names),
     }
     return out, dbg
 
-reorder_only_personalize_sections = PersonalizationConfig
+
+def _build_track_boosts_from_recent_events(
+    recent_events: List[Dict[str, Any]],
+    *,
+    cfg: PersonalizationConfig,
+) -> Dict[str, float]:
+    """
+    Convert recent feedback events into per-track boosts.
+    Only uses positive signals (play/like). Negative signals are handled via suppression elsewhere.
+    """
+    boosts: Dict[str, float] = {}
+
+    if not isinstance(recent_events, list) or not recent_events:
+        return boosts
+
+    for e in recent_events:
+        if not isinstance(e, dict):
+            continue
+        tid = str(e.get("track_id") or "").strip()
+        et = str(e.get("event_type") or "").strip().lower()
+        if not tid or not et:
+            continue
+
+        if et == "like":
+            boosts[tid] = float(boosts.get(tid, 0.0)) + float(cfg.like_boost)
+        elif et == "play":
+            boosts[tid] = float(boosts.get(tid, 0.0)) + float(cfg.play_boost)
+
+    return boosts
+
+
+def reorder_only_personalize_sections(
+    *,
+    sections: Dict[str, list],
+    recent_events: List[Dict[str, Any]],
+    user_id: str,
+    debug: bool,
+    config: Optional[PersonalizationConfig] = None,
+) -> Tuple[Dict[str, list], Dict[str, Any]]:
+    """
+    API used by feed_routes.py for v1.5.6 Step 1.4
+    Signature must accept:
+      sections, recent_events, user_id, debug, config
+    """
+    cfg = config or PersonalizationConfig()
+
+    track_boosts = _build_track_boosts_from_recent_events(recent_events, cfg=cfg)
+
+    # Apply reorder-only to default rails only (NOT for_you)
+    section_names = [s for s in cfg.default_section_names if isinstance(sections.get(s), list)]
+    out, apply_dbg = apply_reorder_only_personalization(
+        sections,
+        track_boosts=track_boosts,
+        section_names=section_names,
+        cfg=cfg,
+    )
+
+    personalization_dbg: Dict[str, Any] = {
+        "reorder_only": True,
+        "user_id": user_id,
+        "recent_events_considered": int(len(recent_events)) if isinstance(recent_events, list) else 0,
+        "track_boosts_n": int(len(track_boosts)),
+        "track_boosts_sample": dict(list(track_boosts.items())[:10]) if debug else None,
+    }
+    personalization_dbg.update(apply_dbg)
+
+    return out, personalization_dbg

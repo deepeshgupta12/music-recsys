@@ -12,7 +12,7 @@ from musicrec.for_you import (
     build_for_you_recommender_from_feature_table,
     for_you_item_to_api_dict,
 )
-from musicrec.personalization import reorder_only_personalize_sections  # v1.5.6 Step 1.4B
+from musicrec.personalization import PersonalizationConfig, reorder_only_personalize_sections  # v1.5.6 Step 1.4
 from musicrec.session_store import SessionEvent
 from musicrec.storage.feedback_store import FeedbackStore
 from musicrec.storage.feature_table import load_feature_table
@@ -152,26 +152,50 @@ def feed_home(
     sections, dbg = feeds.home_feed(q)
 
     user_id = _clean_user_id(x_user_id)
-    suppressed = set()
+    suppressed: set[str] = set()
     removed_by_section: Dict[str, int] = {}
+    personalization_dbg: Dict[str, Any] = {}
+
+    # 1) Suppression (dislike/skip)
     if user_id:
-        suppressed = store.suppressed_track_ids(user_id=user_id, event_types=("dislike", "skip"), days=365)
+        suppressed = store.suppressed_track_ids(
+            user_id=user_id,
+            event_types=("dislike", "skip"),
+            days=365,
+        )
         before = sections
         sections = _apply_suppression(sections, suppressed)
         removed_by_section = _suppression_removed_counts(before, sections)
+
+        # 2) Step 1.4 reorder-only personalization (DOES NOT change sets; only order)
+        recent = store.recent_events(user_id=user_id, limit=500)
+        cfg = PersonalizationConfig()  # defaults for v1.5.6 Step 1.4
+        sections, personalization_dbg = reorder_only_personalize_sections(
+            sections=sections,
+            recent_events=recent,
+            user_id=user_id,
+            debug=bool(debug),
+            config=cfg,
+        )
 
     body: Dict[str, Any] = {"ok": True, "country": country, "n": int(n), "sections": sections}
 
     if debug:
         d = dict(dbg or {})
         d.setdefault("fallback_used", {})
-        d.setdefault("sections_returned", {k: int(len(v)) for k, v in sections.items() if isinstance(v, list)})
+        d.setdefault(
+            "sections_returned",
+            {k: int(len(v)) for k, v in sections.items() if isinstance(v, list)},
+        )
 
         if user_id:
             d["disliked_suppressed_count"] = int(len(suppressed))
             d["suppressed_removed_by_section"] = removed_by_section
             d["suppressed_ids_n"] = int(len(suppressed))
             d["suppressed_event_types"] = ["dislike", "skip"]
+
+            # Step 1.4 debug block
+            d["personalization"] = personalization_dbg
 
         body["debug"] = d
 
@@ -197,13 +221,27 @@ def feed_genre(
     sections, dbg = feeds.genre_feed(q)
 
     user_id = _clean_user_id(x_user_id)
-    suppressed = set()
+    suppressed: set[str] = set()
     removed_by_section: Dict[str, int] = {}
+    personalization_dbg: Dict[str, Any] = {}
+
+    # 1) Suppression (dislike/skip)
     if user_id:
         suppressed = store.suppressed_track_ids(user_id=user_id, event_types=("dislike", "skip"), days=365)
         before = sections
         sections = _apply_suppression(sections, suppressed)
         removed_by_section = _suppression_removed_counts(before, sections)
+
+        # 2) Step 1.4 reorder-only personalization
+        recent = store.recent_events(user_id=user_id, limit=500)
+        cfg = PersonalizationConfig()
+        sections, personalization_dbg = reorder_only_personalize_sections(
+            sections=sections,
+            recent_events=recent,
+            user_id=user_id,
+            debug=bool(debug),
+            config=cfg,
+        )
 
     body: Dict[str, Any] = {
         "ok": True,
@@ -224,6 +262,8 @@ def feed_genre(
             d["suppressed_ids_n"] = int(len(suppressed))
             d["suppressed_event_types"] = ["dislike", "skip"]
 
+            d["personalization"] = personalization_dbg
+
         body["debug"] = d
 
     return body
@@ -235,7 +275,7 @@ def feed_for_you(
     n: int = Query(default=10, ge=5, le=200),
     explicit_ok: bool = Query(default=False),
     debug: bool = Query(default=False),
-    # personalization knobs
+    # personalization knobs (for ForYou engine)
     candidate_k: int = Query(default=1200, ge=300, le=20000),
     same_country_only: bool = Query(default=True),
     unique_artist: bool = Query(default=True),
@@ -246,7 +286,6 @@ def feed_for_you(
 ) -> Dict[str, Any]:
     """
     V1.5.6 Step 1.2: Real ForYou engine using session feedback events as taste signals.
-    V1.5.6 Step 1.4B: Reorder-only personalization of base rails (no adds/removals).
     Always returns a 'for_you' rail (may be empty, with fallback reason in debug).
     """
     user_id = _require_user_id(x_user_id)
@@ -330,39 +369,6 @@ def feed_for_you(
     }
     sections, cross_removed = _dedup_other_sections_against_for_you(sections, for_you_ids)
 
-    # v1.5.6 Step 1.4B — reorder-only personalization for base rails
-    # Important: should NOT add/remove items from any rail; only reorder within each rail.
-    reorder_dbg: Dict[str, Any] = {"applied": False, "length_deltas": {}}
-    before_lengths = {k: (len(v) if isinstance(v, list) else None) for k, v in sections.items()}
-
-    try:
-        sections, reorder_dbg = reorder_only_personalize_sections(
-            sections=sections,
-            events=events,
-            # keep the same blend knob you expose in API (so debug matches actual behavior)
-            lambda_relevance=float(lambda_relevance),
-            debug=bool(debug),
-        )
-    except Exception:
-        # Fail-safe: never break the feed if reorder logic has an edge-case
-        reorder_dbg = {
-            "applied": False,
-            "error": "reorder_failed",
-            "length_deltas": {},
-        }
-
-    after_lengths = {k: (len(v) if isinstance(v, list) else None) for k, v in sections.items()}
-    length_deltas: Dict[str, int] = {}
-    for k in set(before_lengths.keys()) | set(after_lengths.keys()):
-        b = before_lengths.get(k)
-        a = after_lengths.get(k)
-        if isinstance(b, int) and isinstance(a, int):
-            length_deltas[k] = int(a - b)
-    # Ensure we always expose this key (tests/debug rely on it staying stable)
-    reorder_dbg.setdefault("length_deltas", length_deltas)
-    # If reorder helper didn’t compute it, overwrite with our computed deltas
-    reorder_dbg["length_deltas"] = length_deltas
-
     body: Dict[str, Any] = {"ok": True, "country": country, "n": int(n), "sections": sections}
 
     if debug:
@@ -381,13 +387,7 @@ def feed_for_you(
             "for_you_fallback_reason": fallback_reason,
             "for_you_debug": for_you_dbg,
             "dedup_removed_against_for_you": cross_removed,
-            # Step 1.4B debug contract
-            "personalization_reorder_only_length_deltas": reorder_dbg.get("length_deltas", {}),
-            "reorder_only_applied": bool(reorder_dbg.get("applied", False)),
         }
-
-        # Optional extra debug (only when debug=true, and safe to include)
-        d["personalization"]["reorder_only_debug"] = reorder_dbg
 
         body["debug"] = d
 
