@@ -19,3 +19,5 @@ data/processed/
 
 # Logs
 *.log
+# local sessions
+.cache/sessions/

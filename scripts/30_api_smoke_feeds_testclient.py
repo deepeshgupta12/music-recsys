@@ -1,21 +1,43 @@
-from fastapi.testclient import TestClient
+import os
+import sys
+from typing import Any, Dict
 
-from musicrec.api.main import app
+import requests
 
 
-def main():
-    client = TestClient(app)
+def _base_url() -> str:
+    # Default matches our local dev run: uvicorn musicrec.api.main:app --reload
+    return os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 
-    print("1) GET /feed/home")
-    r1 = client.get("/feed/home", params={"country": "Brazil", "n": 5, "debug": "true"})
-    print(r1.status_code, r1.json())
+
+def _get(path: str, params: Dict[str, Any]) -> None:
+    url = _base_url().rstrip("/") + path
+    r = requests.get(url, params=params, timeout=15)
+    print(r.status_code, r.json())
+
+
+def main() -> int:
+    print("API_BASE_URL =", _base_url())
+
+    # Keep consistent with earlier terminal smoke outputs
+    country = "Brazil"
+    n = 5
+
+    print("\n1) GET /feed/home")
+    _get(
+        "/feed/home",
+        params={"country": country, "n": n, "explicit_ok": "true", "debug": "true"},
+    )
 
     print("\n2) GET /feed/genre")
-    r2 = client.get("/feed/genre", params={"country": "Brazil", "genre": "Rock", "n": 5, "debug": "true"})
-    print(r2.status_code, r2.json())
+    _get(
+        "/feed/genre",
+        params={"country": country, "genre": "Rock", "n": n, "explicit_ok": "true", "debug": "true"},
+    )
 
     print("\nSmoke test complete.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
