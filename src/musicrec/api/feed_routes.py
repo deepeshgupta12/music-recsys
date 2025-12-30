@@ -7,14 +7,15 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from musicrec.api.feedback_routes import get_feedback_store
 from musicrec.feeds import FeedQuery, SegmentFeeds
-from musicrec.session_store import SessionEvent
-from musicrec.storage.feedback_store import FeedbackStore
-from musicrec.storage.feature_table import load_feature_table
 from musicrec.for_you import (
     ForYouQuery,
     build_for_you_recommender_from_feature_table,
     for_you_item_to_api_dict,
 )
+from musicrec.personalization import reorder_only_personalize_sections  # v1.5.6 Step 1.4B
+from musicrec.session_store import SessionEvent
+from musicrec.storage.feedback_store import FeedbackStore
+from musicrec.storage.feature_table import load_feature_table
 
 router = APIRouter(tags=["feeds"])
 
@@ -57,7 +58,11 @@ def _apply_suppression(
         if not isinstance(items, list):
             out[k] = items
             continue
-        out[k] = [it for it in items if isinstance(it, dict) and it.get("track_id") not in suppressed_ids]
+        out[k] = [
+            it
+            for it in items
+            if isinstance(it, dict) and it.get("track_id") not in suppressed_ids
+        ]
     return out
 
 
@@ -102,7 +107,10 @@ def _ts_to_iso(ts: Any) -> str:
         return "1970-01-01T00:00:00+00:00"
 
 
-def _dedup_other_sections_against_for_you(sections: Dict[str, list], for_you_ids: set[str]) -> Tuple[Dict[str, list], Dict[str, int]]:
+def _dedup_other_sections_against_for_you(
+    sections: Dict[str, list],
+    for_you_ids: set[str],
+) -> Tuple[Dict[str, list], Dict[str, int]]:
     """
     Keep 'for_you' rail intact, remove its track_ids from other list rails.
     Returns (new_sections, removed_counts).
@@ -117,7 +125,11 @@ def _dedup_other_sections_against_for_you(sections: Dict[str, list], for_you_ids
             out[k] = items
             continue
         before_n = len(items)
-        filtered = [it for it in items if not (isinstance(it, dict) and (it.get("track_id") in for_you_ids))]
+        filtered = [
+            it
+            for it in items
+            if not (isinstance(it, dict) and (it.get("track_id") in for_you_ids))
+        ]
         out[k] = filtered
         removed[k] = max(0, before_n - len(filtered))
     if "for_you" not in removed:
@@ -234,6 +246,7 @@ def feed_for_you(
 ) -> Dict[str, Any]:
     """
     V1.5.6 Step 1.2: Real ForYou engine using session feedback events as taste signals.
+    V1.5.6 Step 1.4B: Reorder-only personalization of base rails (no adds/removals).
     Always returns a 'for_you' rail (may be empty, with fallback reason in debug).
     """
     user_id = _require_user_id(x_user_id)
@@ -252,6 +265,7 @@ def feed_for_you(
     # Build events for ForYou from recent feedback
     recent = store.recent_events(user_id=user_id, limit=500)
     events: list[SessionEvent] = []
+
     for e in recent:
         if not isinstance(e, dict):
             continue
@@ -309,8 +323,45 @@ def feed_for_you(
     sections["for_you"] = for_you_items[: int(n)]
 
     # Cross-rail de-dup: remove for_you track_ids from other rails
-    for_you_ids = {str(it.get("track_id")) for it in sections["for_you"] if isinstance(it, dict) and it.get("track_id")}
+    for_you_ids = {
+        str(it.get("track_id"))
+        for it in sections["for_you"]
+        if isinstance(it, dict) and it.get("track_id")
+    }
     sections, cross_removed = _dedup_other_sections_against_for_you(sections, for_you_ids)
+
+    # v1.5.6 Step 1.4B — reorder-only personalization for base rails
+    # Important: should NOT add/remove items from any rail; only reorder within each rail.
+    reorder_dbg: Dict[str, Any] = {"applied": False, "length_deltas": {}}
+    before_lengths = {k: (len(v) if isinstance(v, list) else None) for k, v in sections.items()}
+
+    try:
+        sections, reorder_dbg = reorder_only_personalize_sections(
+            sections=sections,
+            events=events,
+            # keep the same blend knob you expose in API (so debug matches actual behavior)
+            lambda_relevance=float(lambda_relevance),
+            debug=bool(debug),
+        )
+    except Exception:
+        # Fail-safe: never break the feed if reorder logic has an edge-case
+        reorder_dbg = {
+            "applied": False,
+            "error": "reorder_failed",
+            "length_deltas": {},
+        }
+
+    after_lengths = {k: (len(v) if isinstance(v, list) else None) for k, v in sections.items()}
+    length_deltas: Dict[str, int] = {}
+    for k in set(before_lengths.keys()) | set(after_lengths.keys()):
+        b = before_lengths.get(k)
+        a = after_lengths.get(k)
+        if isinstance(b, int) and isinstance(a, int):
+            length_deltas[k] = int(a - b)
+    # Ensure we always expose this key (tests/debug rely on it staying stable)
+    reorder_dbg.setdefault("length_deltas", length_deltas)
+    # If reorder helper didn’t compute it, overwrite with our computed deltas
+    reorder_dbg["length_deltas"] = length_deltas
 
     body: Dict[str, Any] = {"ok": True, "country": country, "n": int(n), "sections": sections}
 
@@ -330,7 +381,13 @@ def feed_for_you(
             "for_you_fallback_reason": fallback_reason,
             "for_you_debug": for_you_dbg,
             "dedup_removed_against_for_you": cross_removed,
+            # Step 1.4B debug contract
+            "personalization_reorder_only_length_deltas": reorder_dbg.get("length_deltas", {}),
+            "reorder_only_applied": bool(reorder_dbg.get("applied", False)),
         }
+
+        # Optional extra debug (only when debug=true, and safe to include)
+        d["personalization"]["reorder_only_debug"] = reorder_dbg
 
         body["debug"] = d
 
