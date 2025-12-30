@@ -1,264 +1,135 @@
-# Music RecSys API (V1)
+# music-recsys API (V1.4.7)
 
-Base URL (local): `http://127.0.0.1:8000`
+Base URL (local dev)
+- `http://127.0.0.1:8000`
 
-This API provides:
-- Session event capture (play/like)
-- “For You” recommendations from session context
-- Similar tracks (KNN)
-- Hybrid similar tracks (KNN + rerank blend)
-- Playlist generation from a seed (diversified)
-
-## Conventions
-
-### Track ID
-- `track_id` is a string like `TRK-BEBD53DA84E1`
-
-### Boolean query params
-FastAPI accepts booleans as:
-- `true/false` (recommended)
-- Also works with Python bools when using TestClient.
-
-### Debug
-When `debug=true`, responses include a `debug` object with internal details useful for QA.
+All endpoints return JSON. Unless stated otherwise, errors follow:
+- `400` for invalid/missing parameters
+- `404` for unknown resources (e.g., unknown track_id)
+- `500` for unexpected server errors
 
 ---
 
-## POST `/session/event`
+## Common object: TrackItem
 
-Record a user event in a session.
+A track item returned inside `sections` / `results`.
 
-### Body (JSON)
-- `session_id` (string, required)
-- `track_id` (string, required)
-- `event_type` (string, required)  
-  Expected events for V1:
-  - `play`
-  - `like`
+| Field | Type | Notes |
+|---|---|---|
+| `track_id` | string | Stable identifier, e.g. `TRK-80416E23DD93` |
+| `score` | number | Section-specific ranking score |
+| `track_name` | string | Track title |
+| `artist_name` | string | Primary artist display name |
+| `country` | string | Country label used for filtering (example: `Brazil`) |
+| `genre` | string | Genre label (example: `Rock`) |
+| `popularity` | integer | 0–100 (dataset-derived) |
+| `stream_count` | integer | Dataset-derived |
+| `release_date` | string | ISO-like string (dataset-derived) |
+
+---
+
+# Feeds (V1.4.x)
+
+Feeds are “rail/section” style endpoints that return multiple curated lists under `sections`.
+
+**Guaranteed behavior added in V1.4.5+**
+- No empty rails: if a rail is empty in strict mode (e.g., `country+genre`), the API falls back to a broader filter (typically `country-only`) for that rail.
+- Artist de-duplication: within each rail, results are de-duplicated by artist name (case-insensitive, whitespace-trimmed). If `artist_name` is missing/blank, uniqueness falls back to `track_id`.
+- Cross-section de-duplication (V1.4.6): the same `track_id` will not appear in multiple rails; duplicates are removed deterministically while preserving section order as much as possible.
+
+---
+
+## GET `/feed/home`
+
+Home feed for a country.
+
+### Query params
+
+| Param | Type | Required | Default | Notes |
+|---|---|---:|---:|---|
+| `country` | string | Yes | – | Example: `Brazil` |
+| `n` | int | No | 25 | 1–200, number of items per rail |
+| `explicit_ok` | bool | No | true | If false, filters out explicit tracks |
+| `debug` | bool | No | false | If true, includes a `debug` object |
 
 ### Response (200)
+
 ```json
 {
   "ok": true,
-  "session_id": "ses-xxx",
-  "events_count": 2
-}
-```
-
-### Errors
-- 400: invalid payload (missing fields / bad event type)
-- 500: storage error (SessionStore failure)
-
----
-
-## GET `/for_you`
-
-Return recommendations personalized to a session’s events.
-
-### Query params
-- `session_id` (string, required)
-- `n` (int, default: 25) — number of tracks to return
-- `candidate_k` (int, default: 1200) — candidate set size used internally
-- `same_country_only` (bool, default: false)
-- `unique_artist` (bool, default: false)
-- `max_per_genre` (int, default: 10)
-- `explicit_ok` (bool, default: true)
-- `debug` (bool, default: false)
-
-### Response (200)
-```json
-{
-  "session_id": "ses-xxx",
-  "events_count": 2,
-  "seed_track_id": "TRK-...",
-  "n": 25,
-  "returned": 25,
-  "results": [
-    {
-      "track_id": "TRK-...",
-      "score": 0.91,
-      "track_name": "…",
-      "artist_name": "…",
-      "country": "Brazil",
-      "genre": "Rock",
-      "popularity": 50,
-      "stream_count": 3000,
-      "release_date": "2015-04-02 00:00:00"
-    }
-  ],
-  "debug": {
-    "seed_idx": 0,
-    "seed_track_name": "…",
-    "seed_artist_name": "…",
-    "filters": { "...": "..." },
-    "available_candidates": 8479,
-    "candidate_k": 1200,
-    "weights": {
-      "w_sim": 0.7,
-      "w_momentum": 0.15,
-      "w_popularity": 0.1,
-      "w_freshness": 0.05
-    }
-  }
-}
-```
-
-### Errors
-- 404: session not found / no events recorded for session (implementation-dependent)
-- 400: invalid params (e.g., candidate_k too small/large, invalid constraints)
-- 500: internal error
-
----
-
-## GET `/recommend/similar`
-
-Return KNN-based similar tracks for a seed.
-
-### Query params
-- `seed_track_id` (string, required)
-- `k` (int, default: 5)
-- `same_country_only` (bool, default: false)
-- `country` (string, optional) — if provided, filter to this country
-- `exclude_same_artist` (bool, default: false)
-- `explicit_ok` (bool, default: true)
-- `debug` (bool, default: false)
-
-### Response (200)
-```json
-{
-  "seed_track_id": "TRK-...",
-  "k": 5,
-  "returned": 5,
-  "results": [
-    {
-      "track_id": "TRK-...",
-      "score": 0.96,
-      "track_name": "…",
-      "artist_name": "…",
-      "country": "Brazil",
-      "genre": "Classical",
-      "popularity": 60,
-      "stream_count": 57000,
-      "release_date": "2015-06-11 00:00:00"
-    }
-  ],
-  "debug": {
-    "seed_idx": 0,
-    "seed_track_name": "…",
-    "seed_artist_name": "…",
-    "filters": { "...": "..." },
-    "available_candidates": 8479
-  }
-}
-```
-
-### Errors
-- 404: seed_track_id not found
-- 400: invalid k / invalid constraints
-
----
-
-## GET `/recommend/similar_hybrid`
-
-Return similar tracks using:
-1) KNN retrieval
-2) weighted rerank over multiple signals
-
-### Query params
-All params from `/recommend/similar`, plus:
-- `candidate_k` (int, default: 200) — candidate pool for hybrid rerank
-- `w_sim` (float, default: 0.7)
-- `w_momentum` (float, default: 0.15)
-- `w_popularity` (float, default: 0.1)
-- `w_freshness` (float, default: 0.05)
-
-### Weight guard
-At least one weight must be > 0 (sum must be > 0). Otherwise API returns 400.
-
-### Response (200)
-```json
-{
-  "seed_track_id": "TRK-...",
-  "k": 5,
-  "candidate_k": 200,
-  "returned": 5,
-  "weights": {
-    "w_sim": 0.7,
-    "w_momentum": 0.15,
-    "w_popularity": 0.1,
-    "w_freshness": 0.05
+  "country": "Brazil",
+  "n": 5,
+  "sections": {
+    "top": [ { "track_id": "…", "score": 20000000.0, "track_name": "…", "artist_name": "…", "country": "Brazil", "genre": "Rock", "popularity": 100, "stream_count": 20000000, "release_date": "2015-10-07 00:00:00" } ],
+    "rising": [ { "track_id": "…", "score": 186666.66, "track_name": "…", "artist_name": "…", "country": "Brazil", "genre": "Classical", "popularity": 74, "stream_count": 20000000, "release_date": "2016-07-12 00:00:00" } ],
+    "new_releases": [ { "track_id": "…", "score": 0.2, "track_name": "…", "artist_name": "…", "country": "Brazil", "genre": "Indie", "popularity": 57, "stream_count": 2000, "release_date": "2025-12-26 00:00:00" } ],
+    "instrumental": [ { "track_id": "…", "score": 0.8, "track_name": "…", "artist_name": "…", "country": "Brazil", "genre": "Jazz", "popularity": 49, "stream_count": 2000, "release_date": "2015-01-01 00:00:00" } ],
+    "explicit_safe": [ { "track_id": "…", "score": 20000000.0, "track_name": "…", "artist_name": "…", "country": "Brazil", "genre": "EDM", "popularity": 100, "stream_count": 20000000, "release_date": "2015-05-20 00:00:00" } ]
   },
-  "results": [ { "...": "..." } ],
   "debug": {
-    "available_candidates": 8479,
-    "candidate_k": 200,
-    "weights": { "...": "..." },
-    "hybrid_top_scores": [0.77, 0.63, 0.59]
+    "country": "Brazil",
+    "genre": null,
+    "explicit_ok": true,
+    "base_rows": 8480,
+    "sections_returned": { "top": 5, "rising": 5, "new_releases": 5, "instrumental": 5, "explicit_safe": 5 },
+    "fallback_used": {},
+    "cross_section_dedup_removed": { "top": 0, "rising": 1, "new_releases": 0, "instrumental": 0, "explicit_safe": 0 },
+    "n_search": 25
   }
 }
 ```
 
-### Errors
-- 404: seed_track_id not found
-- 400: invalid candidate_k (too small / too large), invalid weights
+Notes:
+- `sections` is always a dict. Each known rail key maps to a list (possibly empty only if the entire dataset is empty for the filter).
+- With `debug=true`, `debug.fallback_used` tells which rails used fallback sourcing.
 
 ---
 
-## GET `/playlist/from_seed`
+## GET `/feed/genre`
 
-Generate a diversified playlist from a seed.
+Genre feed for a country + genre.
 
 ### Query params
-- `seed_track_id` (string, required)
-- `n_tracks` (int, default: 25)
-- `candidate_k` (int, default: 800)
-- `same_country_only` (bool, default: false)
-- `unique_artist` (bool, default: false)
-- `max_per_genre` (int, default: 8)
-- `explicit_ok` (bool, default: true)
-- `debug` (bool, default: false)
 
-Hybrid weights (same as `/recommend/similar_hybrid`):
-- `w_sim`, `w_momentum`, `w_popularity`, `w_freshness` (defaults as above)
+| Param | Type | Required | Default | Notes |
+|---|---|---:|---:|---|
+| `country` | string | Yes | – | Example: `Brazil` |
+| `genre` | string | Yes | – | Example: `Rock` (case-insensitive) |
+| `n` | int | No | 25 | 1–200, number of items per rail |
+| `explicit_ok` | bool | No | true | If false, filters out explicit tracks |
+| `debug` | bool | No | false | If true, includes a `debug` object |
 
 ### Response (200)
+
+Same shape as `/feed/home`, plus `genre` at top level:
+
 ```json
 {
-  "seed_track_id": "TRK-...",
-  "n_tracks": 25,
-  "candidate_k": 800,
-  "returned": 25,
-  "weights": { "...": "..." },
-  "playlist": [
-    {
-      "track_id": "TRK-...",
-      "track_name": "…",
-      "artist_name": "…",
-      "genre": "…",
-      "country": "…",
-      "popularity": 60,
-      "stream_count": 57000,
-      "release_date": "2015-06-11 00:00:00",
-      "relevance_score": 1.0,
-      "redundancy_penalty": 0.96,
-      "mmr_score": 0.50
-    }
-  ],
-  "debug": {
-    "requested_n": 25,
-    "returned_n": 25,
-    "candidate_k": 800,
-    "lambda_relevance": 0.75,
-    "unique_artist": true,
-    "max_per_genre": 8,
-    "genre_counts": {
-      "Rock": 5,
-      "Classical": 3
-    }
-  }
+  "ok": true,
+  "country": "Brazil",
+  "genre": "Rock",
+  "n": 5,
+  "sections": { "...": [] },
+  "debug": { "...": "..." }
 }
 ```
 
-### Errors
-- 404: seed_track_id not found
-- 400: invalid candidate_k / invalid weights / invalid constraints
+Fallback behavior:
+- If a rail (commonly `instrumental`) is empty under strict `country+genre`, the API falls back to a broader query for **that rail only** (typically `country-only`) so the rail is non-empty.
+- `debug.fallback_used` will record any rails where fallback was applied.
+
+---
+
+# Other endpoints (legacy; may exist depending on your current branch)
+
+These were present in earlier V1.3.x snapshots and may still exist:
+
+- `GET /health`
+- `GET /recommend/similar`
+- `GET /recommend/similar_hybrid`
+- `GET /playlist/from_seed`
+- `POST /session/event`
+- `GET /for_you`
+- `GET /for_you/from_session`
+
+If you want this `api.md` to include the exact **current** parameters + response schemas for these endpoints too, point me to your latest `src/musicrec/api/main.py` (or paste it), and I’ll regenerate the doc to match your current code precisely.
