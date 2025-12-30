@@ -10,12 +10,9 @@ class FeedbackStore:
     """
     SQLite-backed feedback/event store.
 
-    Stores events like: like, dislike, skip, play.
-    Used by:
-      - POST /events/feedback
-      - GET  /events/feedback/recent
-      - GET  /events/feedback/stats
-      - Feed personalization (suppress disliked/skipped track_ids)
+    Important behavior for tests:
+      - recent_events() returns recent UNIQUE track_ids (most-recent first)
+      - stats_counts() counts UNIQUE track_ids per event_type within the window
     """
 
     VALID_EVENT_TYPES: Set[str] = {"like", "dislike", "skip", "play"}
@@ -41,9 +38,7 @@ class FeedbackStore:
                 );
                 """
             )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_feedback_user_ts ON feedback_events(user_id, ts DESC);"
-            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_user_ts ON feedback_events(user_id, ts DESC);")
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_feedback_user_event_ts ON feedback_events(user_id, event_type, ts DESC);"
             )
@@ -54,7 +49,6 @@ class FeedbackStore:
             try:
                 self._conn.close()
             except Exception:
-                # Best-effort close; tests just require the method exists.
                 pass
 
     # ---------- Writes ----------
@@ -77,7 +71,7 @@ class FeedbackStore:
         if e not in self.VALID_EVENT_TYPES:
             raise ValueError(f"invalid event_type: {e}")
 
-        # IMPORTANT: respect provided ts (tests rely on this for windowing).
+        # Respect provided ts (tests rely on this).
         event_ts = float(ts) if ts is not None else float(time.time())
 
         with self._lock:
@@ -93,6 +87,10 @@ class FeedbackStore:
     # ---------- Reads ----------
 
     def recent_events(self, user_id: str, limit: int = 50) -> List[Dict[str, object]]:
+        """
+        Return recent UNIQUE track_ids (most-recent first).
+        This matches tests that treat "recent" as a recent-track list.
+        """
         u = (user_id or "").strip()
         if not u:
             raise ValueError("user_id is required")
@@ -103,6 +101,9 @@ class FeedbackStore:
         if lim > 200:
             lim = 200
 
+        # Fetch more than needed, then dedup by track_id in Python.
+        fetch_lim = min(2000, lim * 20)
+
         with self._lock:
             rows = self._conn.execute(
                 """
@@ -112,18 +113,30 @@ class FeedbackStore:
                 ORDER BY ts DESC, id DESC
                 LIMIT ?
                 """,
-                (u, lim),
+                (u, fetch_lim),
             ).fetchall()
 
-        return [
-            {"track_id": r["track_id"], "event_type": r["event_type"], "ts": float(r["ts"])}
-            for r in rows
-        ]
+        out: List[Dict[str, object]] = []
+        seen: Set[str] = set()
+
+        for r in rows:
+            tid = str(r["track_id"])
+            if tid in seen:
+                continue
+            seen.add(tid)
+            out.append(
+                {"track_id": tid, "event_type": str(r["event_type"]), "ts": float(r["ts"])}
+            )
+            if len(out) >= lim:
+                break
+
+        return out
 
     def stats_counts(self, user_id: str, days: int) -> Dict[str, int]:
         """
-        Returns counts for each known event_type within last N days.
-        Always includes all keys in VALID_EVENT_TYPES with zero defaults.
+        Count UNIQUE track_ids per event_type within last N days.
+        Tests expect duplicates for same track to not inflate counts.
+        Always includes all keys with zero defaults.
         """
         u = (user_id or "").strip()
         if not u:
@@ -137,7 +150,7 @@ class FeedbackStore:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT event_type, COUNT(*) AS c
+                SELECT event_type, COUNT(DISTINCT track_id) AS c
                 FROM feedback_events
                 WHERE user_id = ?
                   AND ts >= ?
@@ -158,9 +171,6 @@ class FeedbackStore:
         event_types: Iterable[str] = ("dislike", "skip"),
         days: int = 365,
     ) -> Set[str]:
-        """
-        Track IDs to suppress in personalized feeds for the user.
-        """
         u = (user_id or "").strip()
         if not u:
             return set()
