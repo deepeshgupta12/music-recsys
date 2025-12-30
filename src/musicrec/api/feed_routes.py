@@ -3,14 +3,14 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, Header, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
-from musicrec.feeds import FeedQuery, SegmentFeeds
 from musicrec.api.feedback_routes import get_feedback_store
+from musicrec.feeds import FeedQuery, SegmentFeeds
 from musicrec.storage.feedback_store import FeedbackStore
 from musicrec.storage.feature_table import load_feature_table
 
-router = APIRouter()
+router = APIRouter(tags=["feeds"])
 
 
 @lru_cache(maxsize=1)
@@ -19,101 +19,96 @@ def _get_feeds_engine() -> SegmentFeeds:
     return SegmentFeeds(ft)
 
 
+def _clean_user_id(x_user_id: Optional[str]) -> Optional[str]:
+    if x_user_id is None:
+        return None
+    u = x_user_id.strip()
+    return u if u else None
+
+
 def _apply_suppression(
-    sections: Dict[str, Any],
-    suppressed: set[str],
-) -> Dict[str, Any]:
-    if not suppressed:
+    sections: Dict[str, list],
+    suppressed_ids: set[str],
+) -> Dict[str, list]:
+    if not suppressed_ids:
         return sections
 
-    out: Dict[str, Any] = {}
-    for name, items in sections.items():
+    out: Dict[str, list] = {}
+    for k, items in sections.items():
         if not isinstance(items, list):
-            out[name] = items
+            out[k] = items
             continue
-        out[name] = [it for it in items if str(it.get("track_id", "")) not in suppressed]
+        out[k] = [it for it in items if isinstance(it, dict) and it.get("track_id") not in suppressed_ids]
     return out
-
-
-def _ensure_debug_contract(dbg: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Tests expect debug=true to always include 'fallback_used'
-    (even if empty dict).
-    """
-    if "fallback_used" not in dbg:
-        dbg["fallback_used"] = {}
-    return dbg
 
 
 @router.get("/feed/home")
 def feed_home(
-    country: str = Query(..., min_length=1),
-    n: int = Query(10, ge=1, le=100),
-    debug: bool = Query(False),
+    country: str = Query(...),
+    n: int = Query(default=10, ge=1, le=200),
+    explicit_ok: bool = Query(default=False),
+    debug: bool = Query(default=False),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
     store: FeedbackStore = Depends(get_feedback_store),
 ) -> Dict[str, Any]:
     feeds = _get_feeds_engine()
 
-    q = FeedQuery(country=country, n=n)
+    q = FeedQuery(country=country, genre=None, n=n, explicit_ok=explicit_ok, debug=debug)
+
     sections, dbg = feeds.home_feed(q)
 
-    if x_user_id and x_user_id.strip():
-        suppressed = store.suppressed_track_ids(user_id=x_user_id.strip())
+    user_id = _clean_user_id(x_user_id)
+    if user_id:
+        suppressed = store.suppressed_track_ids(user_id=user_id, event_types=("dislike", "skip"), days=365)
         sections = _apply_suppression(sections, suppressed)
-        if debug:
-            dbg = dict(dbg)
-            dbg["personalization"] = {"suppressed_n": len(suppressed)}
 
-    # ---- response shape expected by tests ----
-    resp: Dict[str, Any] = {
-        "ok": True,
-        "country": country,
-        "n": n,
-        "sections": sections,
-    }
+    body: Dict[str, Any] = {"ok": True, "country": country, "n": int(n), "sections": sections}
 
     if debug:
-        dbg = dict(dbg) if dbg is not None else {}
-        dbg = _ensure_debug_contract(dbg)
-        resp["debug"] = dbg
+        d = dict(dbg or {})
+        d.setdefault("fallback_used", {})
+        d.setdefault("sections_returned", {k: int(len(v)) for k, v in sections.items() if isinstance(v, list)})
+        body["debug"] = d
 
-    return resp
+    return body
 
 
 @router.get("/feed/genre")
 def feed_genre(
-    country: str = Query(..., min_length=1),
-    genre: str = Query(..., min_length=1),
-    n: int = Query(10, ge=1, le=100),
-    debug: bool = Query(False),
+    country: str = Query(...),
+    genre: str = Query(...),
+    n: int = Query(default=10, ge=1, le=200),
+    explicit_ok: bool = Query(default=False),
+    debug: bool = Query(default=False),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
     store: FeedbackStore = Depends(get_feedback_store),
 ) -> Dict[str, Any]:
     feeds = _get_feeds_engine()
 
-    q = FeedQuery(country=country, genre=genre, n=n)
+    if not genre or not genre.strip():
+        raise HTTPException(status_code=400, detail="genre is required")
+
+    q = FeedQuery(country=country, genre=genre.strip(), n=n, explicit_ok=explicit_ok, debug=debug)
+
     sections, dbg = feeds.genre_feed(q)
 
-    if x_user_id and x_user_id.strip():
-        suppressed = store.suppressed_track_ids(user_id=x_user_id.strip())
+    user_id = _clean_user_id(x_user_id)
+    if user_id:
+        suppressed = store.suppressed_track_ids(user_id=user_id, event_types=("dislike", "skip"), days=365)
         sections = _apply_suppression(sections, suppressed)
-        if debug:
-            dbg = dict(dbg)
-            dbg["personalization"] = {"suppressed_n": len(suppressed)}
 
-    # ---- response shape expected by tests ----
-    resp: Dict[str, Any] = {
+    body: Dict[str, Any] = {
         "ok": True,
         "country": country,
-        "genre": genre,
-        "n": n,
+        "genre": genre.strip(),
+        "n": int(n),
         "sections": sections,
     }
 
     if debug:
-        dbg = dict(dbg) if dbg is not None else {}
-        dbg = _ensure_debug_contract(dbg)
-        resp["debug"] = dbg
+        d = dict(dbg or {})
+        d.setdefault("fallback_used", {})
+        d.setdefault("sections_returned", {k: int(len(v)) for k, v in sections.items() if isinstance(v, list)})
+        body["debug"] = d
 
-    return resp
+    return body
