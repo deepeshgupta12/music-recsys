@@ -35,4 +35,4 @@ jobs:
 
       - name: Run API smoke (TestClient)
         run: |
-          python scripts/11_api_smoke_testclient.py
+          python scripts/30_api_smoke_feeds_testclient.py
