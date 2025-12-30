@@ -27,7 +27,10 @@ class SegmentFeeds:
       - Returns (sections, debug_dict)
       - Per-section artist de-dup
       - V1.4.5: targeted fallback so sections don't come back empty where possible
+      - V1.4.6: cross-section track de-dup so the same track doesn't show in multiple rails
     """
+
+    SECTION_ORDER = ["top", "rising", "new_releases", "instrumental", "explicit_safe"]
 
     def __init__(self, df: pd.DataFrame):
         self.df = df.copy()
@@ -39,8 +42,7 @@ class SegmentFeeds:
     @staticmethod
     def _norm_artist_name(name: Any) -> str:
         s = "" if name is None else str(name)
-        s = s.strip().lower()
-        return s
+        return s.strip().lower()
 
     @classmethod
     def _artist_key_for_row(cls, artist_name: Any, track_id: Any) -> str:
@@ -82,6 +84,62 @@ class SegmentFeeds:
         dd["_artist_key"] = artist_key
         dd = dd.drop_duplicates(subset=["_artist_key"], keep="first").drop(columns=["_artist_key"])
         return dd
+
+    @staticmethod
+    def _norm_track_key(item: Dict[str, Any]) -> str:
+        """
+        Canonical cross-rail key. Prefer track_id; if missing, use a composite fallback.
+        """
+        tid = item.get("track_id")
+        if tid is not None and str(tid).strip():
+            return str(tid).strip()
+        # fallback key (rare)
+        an = (item.get("artist_name") or "")
+        tn = (item.get("track_name") or "")
+        return f"__fallback__:{str(an).strip().lower()}:{str(tn).strip().lower()}"
+
+    def _cross_section_dedup(
+        self,
+        sections: Dict[str, List[Dict[str, Any]]],
+        *,
+        n_final: int,
+        order: Optional[List[str]] = None,
+    ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, int]]:
+        """
+        Remove duplicate tracks across sections in a stable way.
+        Earlier sections keep items; later sections lose duplicates.
+        Returns (deduped_sections, removed_counts_per_section).
+        """
+        order = order or self.SECTION_ORDER
+        seen: set[str] = set()
+        removed: Dict[str, int] = {}
+
+        out: Dict[str, List[Dict[str, Any]]] = {}
+
+        # process in priority order
+        for name in order:
+            items = sections.get(name, [])
+            kept: List[Dict[str, Any]] = []
+            rem = 0
+            for it in items:
+                k = self._norm_track_key(it)
+                if k in seen:
+                    rem += 1
+                    continue
+                seen.add(k)
+                kept.append(it)
+                if len(kept) >= n_final:
+                    break
+            out[name] = kept
+            removed[name] = rem
+
+        # carry over any other keys not in order (just in case)
+        for k, v in sections.items():
+            if k not in out:
+                out[k] = v[:n_final]
+                removed[k] = 0
+
+        return out, removed
 
     # ----------------------------
     # Filtering + derived columns
@@ -143,7 +201,7 @@ class SegmentFeeds:
         }
 
     # ----------------------------
-    # Section builders
+    # Section builders (return up to n items)
     # ----------------------------
 
     def _top(self, df: pd.DataFrame, n: int) -> List[Dict[str, Any]]:
@@ -193,7 +251,6 @@ class SegmentFeeds:
         if len(df) == 0:
             return []
         if "_release_dt" not in df.columns:
-            # Should generally exist because we call _add_derived before section building.
             return []
 
         d = df.copy()
@@ -214,16 +271,15 @@ class SegmentFeeds:
 
     def _instrumental(self, df: pd.DataFrame, n: int) -> List[Dict[str, Any]]:
         """
-        Instrumental rail strategy (V1.4.5 hardening):
+        Instrumental rail strategy:
           - Prefer true instrumental tracks: instrumentalness >= 0.9
-          - If none exist in the slice, return top-N most-instrumental tracks (still sorted by instrumentalness desc)
-          - If instrumentalness column missing or all null, fall back to top by stream_count (avoid empty rail)
+          - If none exist in the slice, return top-N most-instrumental tracks
+          - If instrumentalness column missing or all null, fall back to top by stream_count
         """
         if len(df) == 0:
             return []
 
         if "instrumentalness" not in df.columns:
-            # last-resort: avoid empty rail using top
             return self._top(df, n)
 
         d = df.copy()
@@ -235,11 +291,7 @@ class SegmentFeeds:
         d = d.sort_values(["_inst", "stream_count"], ascending=[False, False])
 
         strict = d[d["_inst"] >= 0.9]
-        if len(strict) > 0:
-            picked = strict
-        else:
-            # fallback: highest instrumentalness available
-            picked = d
+        picked = strict if len(strict) > 0 else d
 
         picked = self._dedup_df_by_artist(picked)
         picked = picked.head(n)
@@ -279,7 +331,13 @@ class SegmentFeeds:
         If q.genre exists (genre feed), primary slice is country+genre.
         For any section that comes back empty, do a targeted fallback by dropping genre
         for that section only.
+
+        V1.4.6: After sections are built, we do cross-section dedup by track_id
+        so the same track doesn't appear in multiple rails.
         """
+        n_final = int(q.n)
+        n_search = min(200, max(n_final, n_final * 5))
+
         # Country-only slice (fallback universe)
         base_country = self._apply_base_filters(q, include_genre=False)
         base_country = self._add_derived(base_country)
@@ -293,21 +351,23 @@ class SegmentFeeds:
         fallback_used: Dict[str, str] = {}
 
         def _build_with_fallback(name: str, fn, primary_df: pd.DataFrame) -> List[Dict[str, Any]]:
-            items = fn(primary_df, q.n)
+            items = fn(primary_df, n_search)
             if q.genre and len(items) == 0:
-                fb = fn(base_country, q.n)
+                fb = fn(base_country, n_search)
                 if len(fb) > 0:
                     fallback_used[name] = "dropped_genre"
                     return fb
             return items
 
-        sections: Dict[str, List[Dict[str, Any]]] = {
+        sections_raw: Dict[str, List[Dict[str, Any]]] = {
             "top": _build_with_fallback("top", self._top, base),
             "rising": _build_with_fallback("rising", self._rising, base),
             "new_releases": _build_with_fallback("new_releases", self._new_releases, base),
             "instrumental": _build_with_fallback("instrumental", self._instrumental, base),
             "explicit_safe": _build_with_fallback("explicit_safe", self._explicit_safe, base),
         }
+
+        sections, removed = self._cross_section_dedup(sections_raw, n_final=n_final, order=self.SECTION_ORDER)
 
         dbg: Dict[str, Any] = {}
         if q.debug:
@@ -317,8 +377,11 @@ class SegmentFeeds:
                 "explicit_ok": q.explicit_ok,
                 "base_rows": int(len(base)),
                 "sections_returned": {k: int(len(v)) for k, v in sections.items()},
-                "fallback_used": fallback_used,  # always present (may be empty)
+                "fallback_used": fallback_used,
+                "cross_section_dedup_removed": removed,
+                "n_search": n_search,
             }
+
         return sections, dbg
 
     def genre_feed(self, q: FeedQuery) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
