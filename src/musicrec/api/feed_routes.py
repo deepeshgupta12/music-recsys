@@ -35,6 +35,16 @@ def _apply_suppression(
     return out
 
 
+def _ensure_debug_contract(dbg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Tests expect debug=true to always include 'fallback_used'
+    (even if empty dict).
+    """
+    if "fallback_used" not in dbg:
+        dbg["fallback_used"] = {}
+    return dbg
+
+
 @router.get("/feed/home")
 def feed_home(
     country: str = Query(..., min_length=1),
@@ -55,9 +65,19 @@ def feed_home(
             dbg = dict(dbg)
             dbg["personalization"] = {"suppressed_n": len(suppressed)}
 
-    resp: Dict[str, Any] = {"ok": True, "query": {"country": country, "n": n}, "sections": sections}
+    # ---- response shape expected by tests ----
+    resp: Dict[str, Any] = {
+        "ok": True,
+        "country": country,
+        "n": n,
+        "sections": sections,
+    }
+
     if debug:
+        dbg = dict(dbg) if dbg is not None else {}
+        dbg = _ensure_debug_contract(dbg)
         resp["debug"] = dbg
+
     return resp
 
 
@@ -82,7 +102,18 @@ def feed_genre(
             dbg = dict(dbg)
             dbg["personalization"] = {"suppressed_n": len(suppressed)}
 
-    resp: Dict[str, Any] = {"ok": True, "query": {"country": country, "genre": genre, "n": n}, "sections": sections}
+    # ---- response shape expected by tests ----
+    resp: Dict[str, Any] = {
+        "ok": True,
+        "country": country,
+        "genre": genre,
+        "n": n,
+        "sections": sections,
+    }
+
     if debug:
+        dbg = dict(dbg) if dbg is not None else {}
+        dbg = _ensure_debug_contract(dbg)
         resp["debug"] = dbg
+
     return resp
