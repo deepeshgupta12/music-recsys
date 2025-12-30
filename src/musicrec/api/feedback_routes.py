@@ -2,75 +2,102 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from musicrec.api.deps import get_feedback_store
+from musicrec.storage.feedback_store import FeedbackStore
+
 
 router = APIRouter(tags=["feedback"])
-
-VALID_EVENT_TYPES = {"like", "dislike", "skip", "save", "unsave"}
 
 
 class FeedbackIn(BaseModel):
     track_id: str = Field(..., min_length=1)
-    event_type: str = Field(..., min_length=1)
-    meta: Dict[str, Any] = Field(default_factory=dict)
+    event_type: str = Field(..., min_length=1)  # play/like/dislike/skip
+    ts: Optional[float] = None  # unix seconds (optional)
+
+
+def require_user_id(
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+) -> str:
+    user_id = (x_user_id or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=400, detail="X-User-Id header is required")
+    return user_id
 
 
 @router.post("/events/feedback")
 def post_feedback(
     payload: FeedbackIn,
-    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    user_id: str = Depends(require_user_id),
+    store: FeedbackStore = Depends(get_feedback_store),
 ) -> Dict[str, Any]:
-    user_id = (x_user_id or "").strip()
-    if not user_id:
-        raise HTTPException(status_code=400, detail="X-User-Id header is required")
-
-    event_type = (payload.event_type or "").strip().lower()
-    if event_type not in VALID_EVENT_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"invalid event_type; allowed={sorted(VALID_EVENT_TYPES)}",
+    """
+    Record a single feedback event.
+    Anonymous-friendly: client passes X-User-Id.
+    """
+    try:
+        store.add_event(
+            user_id=user_id,
+            track_id=payload.track_id,
+            event_type=payload.event_type,
+            ts=payload.ts,
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    track_id = (payload.track_id or "").strip()
-    if not track_id:
-        raise HTTPException(status_code=400, detail="track_id is required")
-
-    store = get_feedback_store()
-    event_id = store.add_event(
-        user_id=user_id,
-        track_id=track_id,
-        event_type=event_type,
-        meta=dict(payload.meta or {}),
-    )
-    return {"ok": True, "event_id": event_id}
+    return {"ok": True}
 
 
 @router.get("/events/feedback/recent")
-def get_recent_feedback(
-    limit: int = Query(50, ge=1, le=500),
-    user_id: Optional[str] = Query(None, description="Optional filter by user_id"),
-    event_type: Optional[str] = Query(None, description="Optional filter by event_type"),
+def feedback_recent(
+    user_id: str = Depends(require_user_id),
+    store: FeedbackStore = Depends(get_feedback_store),
+    limit: int = Query(default=50, ge=1, le=200),
 ) -> Dict[str, Any]:
-    store = get_feedback_store()
-    et = (event_type or "").strip().lower() or None
-    if et is not None and et not in VALID_EVENT_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"invalid event_type; allowed={sorted(VALID_EVENT_TYPES)}",
-        )
+    """
+    Returns most recent feedback events for the user (desc by ts).
+    """
+    try:
+        events = store.recent_events(user_id=user_id, limit=limit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    events = store.recent_events(limit=limit, user_id=user_id, event_type=et)
-    return {"ok": True, "limit": limit, "user_id": user_id, "event_type": et, "events": events}
+    return {
+        "ok": True,
+        "user_id": user_id,
+        "n": len(events),
+        "events": [
+            {
+                "user_id": e.user_id,
+                "track_id": e.track_id,
+                "event_type": e.event_type,
+                "ts": e.ts,
+            }
+            for e in events
+        ],
+    }
 
 
 @router.get("/events/feedback/stats")
-def get_feedback_stats(
-    window_days: int = Query(7, ge=1, le=365),
-    user_id: Optional[str] = Query(None),
+def feedback_stats(
+    user_id: str = Depends(require_user_id),
+    store: FeedbackStore = Depends(get_feedback_store),
+    days: int = Query(default=30, ge=1, le=365),
 ) -> Dict[str, Any]:
-    store = get_feedback_store()
-    stats = store.stats(window_days=window_days, user_id=user_id)
-    return {"ok": True, "stats": stats}
+    """
+    Counts by event_type for the last N days.
+    """
+    try:
+        counts = store.counts_last_days(user_id=user_id, days=days)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "ok": True,
+        "user_id": user_id,
+        "days": days,
+        "counts": counts,
+        "total": int(sum(counts.values())),
+    }

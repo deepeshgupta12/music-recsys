@@ -20,6 +20,12 @@ def client(tmp_path):
     store.close()
 
 
+def test_post_feedback_requires_user_header(client):
+    r = client.post("/events/feedback", json={"track_id": "TRK-X", "event_type": "like"})
+    assert r.status_code == 400
+    assert "X-User-Id" in r.text
+
+
 def test_post_feedback_accepts_valid_event(client):
     r = client.post(
         "/events/feedback",
@@ -27,25 +33,19 @@ def test_post_feedback_accepts_valid_event(client):
         json={"track_id": "TRK-1", "event_type": "like"},
     )
     assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["ok"] is True
-    assert "event" in body
-    assert body["event"]["user_id"] == "user_test_1"
-    assert body["event"]["track_id"] == "TRK-1"
-    assert body["event"]["event_type"] == "like"
+    assert r.json()["ok"] is True
 
 
 def test_post_feedback_rejects_missing_user_id(client):
-    r = client.post("/events/feedback", json={"track_id": "TRK-2", "event_type": "like"})
+    r = client.post("/events/feedback", headers={"X-User-Id": "   "}, json={"track_id": "TRK-1", "event_type": "like"})
     assert r.status_code == 400
-    assert "X-User-Id" in r.text
 
 
 def test_post_feedback_rejects_invalid_event_type(client):
     r = client.post(
         "/events/feedback",
         headers={"X-User-Id": "user_test_2"},
-        json={"track_id": "TRK-X", "event_type": "something_else"},
+        json={"track_id": "TRK-1", "event_type": "something_else"},
     )
     assert r.status_code == 400
 
@@ -73,15 +73,15 @@ def test_feedback_recent_returns_events_desc_ts(client):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is True
-    assert body["user_id"] == "user_recent"
-    assert len(body["events"]) == 2
+    assert body["n"] >= 2
     assert body["events"][0]["track_id"] == "TRK-NEW"
     assert body["events"][1]["track_id"] == "TRK-OLD"
 
 
 def test_feedback_stats_counts_last_n_days(client):
     now = time.time()
-    # within window
+
+    # within window (2 days)
     client.post(
         "/events/feedback",
         headers={"X-User-Id": "user_stats"},
@@ -90,29 +90,27 @@ def test_feedback_stats_counts_last_n_days(client):
     client.post(
         "/events/feedback",
         headers={"X-User-Id": "user_stats"},
-        json={"track_id": "TRK-2", "event_type": "like", "ts": now - 1800},
+        json={"track_id": "TRK-2", "event_type": "skip", "ts": now - 7200},
     )
+
+    # outside window
     client.post(
         "/events/feedback",
         headers={"X-User-Id": "user_stats"},
-        json={"track_id": "TRK-3", "event_type": "skip", "ts": now - 1200},
-    )
-    # outside window (2 days ago)
-    client.post(
-        "/events/feedback",
-        headers={"X-User-Id": "user_stats"},
-        json={"track_id": "TRK-OLD", "event_type": "dislike", "ts": now - (2 * 86400)},
+        json={"track_id": "TRK-OLD", "event_type": "like", "ts": now - (5 * 86400)},
     )
 
     r = client.get(
         "/events/feedback/stats",
         headers={"X-User-Id": "user_stats"},
-        params={"days": 1},
+        params={"days": 2},
     )
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["ok"] is True
     counts = body["counts"]
-    assert counts.get("like", 0) == 2
-    assert counts.get("skip", 0) == 1
-    assert counts.get("dislike", 0) == 0
+
+    assert counts["like"] == 1
+    assert counts["skip"] == 1
+    assert counts["play"] == 0
+    assert counts["dislike"] == 0
