@@ -21,3 +21,14 @@ data/processed/
 *.log
 # local sessions
 .cache/sessions/
+
+# --- music-recsys runtime artifacts ---
+.cache/
+**/.cache/
+*.sqlite
+*.sqlite3
+*.db
+*.jsonl
+
+# If you store API smoke sessions under cache
+.cache/sessions/
