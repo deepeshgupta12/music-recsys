@@ -12,14 +12,11 @@ from musicrec.for_you import (
     build_for_you_recommender_from_feature_table,
     for_you_item_to_api_dict,
 )
-from musicrec.personalization import (  # v1.5.6 Step 1.4/1.5
-    PersonalizationConfig,
-    apply_reorder_only_personalization,
-)
+from musicrec.personalization import PersonalizationConfig, reorder_only_personalize_sections
 from musicrec.session_store import SessionEvent
-from musicrec.storage.feedback_store import FeedbackStore
 from musicrec.storage.feature_table import load_feature_table
-from musicrec.storage.tag_store import TagStore
+from musicrec.storage.feedback_store import FeedbackStore
+from musicrec.storage.tag_store import TagStore, TagStoreConfig  # <-- Step 3.1: import config
 
 router = APIRouter(tags=["feeds"])
 
@@ -38,8 +35,8 @@ def _get_for_you_engine():
 
 @lru_cache(maxsize=1)
 def _get_tag_store() -> TagStore:
-    # Uses repo default tag DB path/config in TagStore
-    return TagStore()
+    # Step 3.1: align with tag_routes.py (same config/path/table)
+    return TagStore(TagStoreConfig())
 
 
 def _clean_user_id(x_user_id: Optional[str]) -> Optional[str]:
@@ -119,10 +116,6 @@ def _dedup_other_sections_against_for_you(
     sections: Dict[str, list],
     for_you_ids: set[str],
 ) -> Tuple[Dict[str, list], Dict[str, int]]:
-    """
-    Keep 'for_you' rail intact, remove its track_ids from other list rails.
-    Returns (new_sections, removed_counts).
-    """
     removed: Dict[str, int] = {}
     out: Dict[str, list] = {}
     for k, items in sections.items():
@@ -145,94 +138,82 @@ def _dedup_other_sections_against_for_you(
     return out, removed
 
 
-def _collect_track_ids_and_items_seen(sections: Dict[str, Any]) -> Tuple[List[str], int]:
+def _collect_track_ids(sections: Dict[str, list]) -> Tuple[set[str], int]:
     """
     Returns:
-      - unique_track_ids: unique track_id values seen across ALL list rails (dict items only)
-      - total_items_seen: total count of dict items across ALL list rails
+      - unique track_ids across all list rails (dict items only)
+      - total_items_seen across all list rails (dict items only)
     """
-    ids: List[str] = []
-    seen: set[str] = set()
-    total_items_seen = 0
-
-    for _, items in (sections or {}).items():
+    ids: set[str] = set()
+    total = 0
+    for items in sections.values():
         if not isinstance(items, list):
             continue
         for it in items:
             if not isinstance(it, dict):
                 continue
-            total_items_seen += 1
+            total += 1
             tid = (it.get("track_id") or "").strip()
-            if not tid:
-                continue
-            if tid not in seen:
-                seen.add(tid)
-                ids.append(tid)
+            if tid:
+                ids.add(tid)
+    return ids, total
+
+
+def _safe_row_to_payload(row: Any) -> Tuple[Dict[str, Any], Optional[str], float]:
+    """
+    Normalize TagStore rows into:
+      - tags dict
+      - provider str|None
+      - updated_at float
+    Supports both dataclass-like objects and dict payloads.
+    """
+    if row is None:
+        return {}, None, 0.0
+
+    if isinstance(row, dict):
+        tags = row.get("tags") or {}
+        provider = row.get("provider")
+        updated_at = row.get("updated_at") or 0.0
+        try:
+            return dict(tags), (str(provider) if provider is not None else None), float(updated_at)
+        except Exception:
+            return dict(tags), (str(provider) if provider is not None else None), 0.0
+
+    tags = getattr(row, "tags", {}) or {}
+    provider = getattr(row, "provider", None)
+    updated_at = getattr(row, "updated_at", 0.0) or 0.0
+    try:
+        return dict(tags), (str(provider) if provider is not None else None), float(updated_at)
+    except Exception:
+        return dict(tags), (str(provider) if provider is not None else None), 0.0
 
     return ids, total_items_seen
 
-
-def _row_to_tags_payload(row: Any) -> Tuple[Dict[str, Any], Optional[str], Optional[float]]:
-    """
-    TagStore rows may be dataclasses/objects or dicts.
-    Normalize extraction into: (tags_dict, provider, updated_at)
-    """
-    if row is None:
-        return {}, None, None
-
-    # object-like
-    tags = getattr(row, "tags", None)
-    provider = getattr(row, "provider", None)
-    updated_at = getattr(row, "updated_at", None)
-
-    # dict-like fallback
-    if tags is None and isinstance(row, dict):
-        tags = row.get("tags")
-        provider = provider or row.get("provider")
-        updated_at = updated_at or row.get("updated_at")
-
-    if tags is None:
-        tags = {}
-    if not isinstance(tags, dict):
-        tags = {}
-
-    try:
-        updated_at_f = float(updated_at) if updated_at is not None else None
-    except Exception:
-        updated_at_f = None
-
-    provider_s = str(provider) if provider is not None else None
-    return tags, provider_s, updated_at_f
-
-
-def _attach_tags_optional(
-    sections: Dict[str, Any],
-    include_tags: bool,
+def _join_tags_into_sections(
+    sections: Dict[str, list],
+    store: TagStore,
     debug: bool,
-    tag_store: TagStore,
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[Dict[str, list], Dict[str, Any]]:
     """
-    If include_tags=true:
-      - Adds fields on each dict item:
-          tags, tags_missing, tags_provider, tags_updated_at
-      - Returns tags_join debug block with correct counters:
-          tracks_requested = unique track_ids seen across ALL rails
+    Adds these fields into every dict item that has a track_id:
+      - tags: dict
+      - tags_missing: bool
+      - tags_provider: str|None
+      - tags_updated_at: float
+
+    Debug contract:
+      tracks_requested = number of UNIQUE track_ids across all rails (dict items)
+      total_items_seen = number of dict items scanned across all rails
     """
-    if not include_tags:
-        return sections, {}
+    unique_ids, total_items_seen = _collect_track_ids(sections)
+    tracks_requested = len(unique_ids)
 
-    # 1) Collect universe across ALL rails
-    ids, total_items_seen = _collect_track_ids_and_items_seen(sections)
-    tracks_requested = len(ids)
-
-    # 2) Lookup (even if result is empty, tracks_requested is still correct)
     found_map: Dict[str, Any] = {}
-    if ids:
-        found_map = tag_store.batch_get(ids)  # contract: dict(track_id -> row/bundle)
+    if tracks_requested > 0:
+        found_map = store.batch_get(sorted(unique_ids))  # type: ignore[attr-defined]
 
-    unique_found = len(found_map or {})
+    unique_found = len(found_map)
 
-    # 3) Attach tags fields (copy item dicts to avoid mutating shared/cached objects)
     tagged_items = 0
     out_sections: Dict[str, Any] = {}
 
@@ -248,15 +229,16 @@ def _attach_tags_optional(
                 continue
 
             tid = (it.get("track_id") or "").strip()
-            row = found_map.get(tid) if tid else None
-            tags, provider, updated_at = _row_to_tags_payload(row)
+            if not tid:
+                new_items.append(it)
+                continue
 
-            it2 = dict(it)
-            if row is None:
-                it2["tags"] = {}
-                it2["tags_missing"] = True
-                it2["tags_provider"] = None
-                it2["tags_updated_at"] = None
+            row = found_map.get(tid)
+            tags, provider, updated_at = _safe_row_to_payload(row)
+
+            missing = row is None
+            if missing:
+                missing_items += 1
             else:
                 it2["tags"] = tags
                 it2["tags_missing"] = False
@@ -264,52 +246,12 @@ def _attach_tags_optional(
                 it2["tags_updated_at"] = updated_at
                 tagged_items += 1
 
-            new_items.append(it2)
-
-        out_sections[rail] = new_items
-
-    missing_items = max(0, int(total_items_seen) - int(tagged_items))
-
-    tags_dbg = {}
-    if debug:
-        tags_dbg = {
-            "tracks_requested": int(tracks_requested),      # <-- FIXED DEFINITION
-            "unique_found": int(unique_found),
-            "total_items_seen": int(total_items_seen),
-            "tagged_items": int(tagged_items),
-            "missing_items": int(missing_items),
-        }
-
-    return out_sections, tags_dbg
-def _build_track_boosts_from_recent_events(recent: list[dict]) -> Tuple[Dict[str, float], int]:
-    """
-    v1.5.6 reorder-only personalization signal:
-      - derive per-track boosts from recent feedback events
-      - de-dupe by track_id and keep the max weight per track
-    Expected weights (aligned with your Step 1.4E debug samples):
-      - like -> 5.0
-      - play -> 2.0
-    """
-    weights: Dict[str, float] = {"like": 5.0, "play": 2.0}
-
-    boosts: Dict[str, float] = {}
-    for e in recent or []:
-        if not isinstance(e, dict):
-            continue
-        tid = (e.get("track_id") or "").strip()
-        et = (e.get("event_type") or "").strip().lower()
-        if not tid or not et:
-            continue
-        w = weights.get(et)
-        if w is None:
-            continue
-        prev = boosts.get(tid)
-        boosts[tid] = w if prev is None else max(prev, w)
-
-    # “recent_events_considered” in your Step 1.4E output matches unique tracks (not raw event rows)
-    considered_unique_tracks = int(len(boosts))
-    return boosts, considered_unique_tracks
-
+            new_it = dict(it)
+            new_it["tags"] = tags
+            new_it["tags_missing"] = bool(missing)
+            new_it["tags_provider"] = provider
+            new_it["tags_updated_at"] = float(updated_at)
+            new_items.append(new_it)
 
 def _maybe_apply_reorder_only_personalization(
     *,
@@ -327,38 +269,79 @@ def _maybe_apply_reorder_only_personalization(
     if not user_id:
         return sections, {}
 
-    recent = store.recent_events(user_id=user_id, limit=500)
-    track_boosts, recent_considered = _build_track_boosts_from_recent_events(recent)
-
-    section_names = [
-        k for k, v in sections.items()
-        if isinstance(v, list) and k != "for_you"
-    ]
-
-    cfg = PersonalizationConfig()
-    new_sections, ro_dbg = apply_reorder_only_personalization(
-        sections,
-        track_boosts=track_boosts,
-        section_names=section_names,
-        cfg=cfg,
-    )
-
-    if not debug:
-        return new_sections, {}
-
-    # Keep debug schema consistent with what you validated in Step 1.4E
-    sample_items = list(track_boosts.items())[:10]
-    personalization_dbg: Dict[str, Any] = {
-        "reorder_only": True,
-        "user_id": user_id,
-        "recent_events_considered": int(recent_considered),
-        "track_boosts_n": int(len(track_boosts)),
-        "track_boosts_sample": dict(sample_items),
+    dbg = {
+        "tracks_requested": int(tracks_requested),
+        "unique_found": int(unique_found),
+        "total_items_seen": int(total_items_seen),
+        "tagged_items": int(tagged_items),
+        "missing_items": int(missing_items),
     }
-    if isinstance(ro_dbg, dict):
-        personalization_dbg.update(ro_dbg)
+    return out, (dbg if debug else {})
 
-    return new_sections, personalization_dbg
+
+# ---------- Step 3 helpers (mood feed) ----------
+
+def _slugify(s: str) -> str:
+    s = (s or "").strip().lower()
+    if not s:
+        return ""
+    out: List[str] = []
+    prev_dash = False
+    for ch in s:
+        is_alnum = ("a" <= ch <= "z") or ("0" <= ch <= "9")
+        if is_alnum:
+            out.append(ch)
+            prev_dash = False
+        else:
+            if not prev_dash:
+                out.append("-")
+                prev_dash = True
+    slug = "".join(out).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug
+
+
+def _item_has_mood(it: Dict[str, Any], mood_slug: str) -> bool:
+    """
+    Matches mood_slug against tags["moods"/"mood"/"scenes"/"scene"].
+    Supports str or list[str] for each.
+    """
+    tags = it.get("tags")
+    if not isinstance(tags, dict):
+        return False
+
+    keys = ["moods", "mood", "scenes", "scene"]
+    vals: List[str] = []
+    for k in keys:
+        v = tags.get(k)
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip():
+            vals.append(v.strip())
+        elif isinstance(v, list):
+            for x in v:
+                if isinstance(x, str) and x.strip():
+                    vals.append(x.strip())
+
+    for v in vals:
+        if _slugify(v) == mood_slug:
+            return True
+    return False
+
+
+def _strip_tag_fields_from_items(items: List[Any]) -> List[Any]:
+    drop = {"tags", "tags_missing", "tags_provider", "tags_updated_at"}
+    out: List[Any] = []
+    for it in items:
+        if not isinstance(it, dict):
+            out.append(it)
+            continue
+        d = dict(it)
+        for k in drop:
+            d.pop(k, None)
+        out.append(d)
+    return out
 
 
 @router.get("/feed/home")
@@ -379,6 +362,7 @@ def feed_home(
     user_id = _clean_user_id(x_user_id)
     suppressed: set[str] = set()
     removed_by_section: Dict[str, int] = {}
+    personalization_dbg: Dict[str, Any] = {}
 
     # 1) Suppression (dislike/skip)
     if user_id:
@@ -387,21 +371,21 @@ def feed_home(
         sections = _apply_suppression(sections, suppressed)
         removed_by_section = _suppression_removed_counts(before, sections)
 
-    # 2) Reorder-only personalization (keeps sets intact; changes order only)
-    sections, personalization_dbg = _maybe_apply_reorder_only_personalization(
-        sections=sections,
-        user_id=user_id,
-        store=store,
-        debug=bool(debug),
-    )
+        # 2) reorder-only personalization (does not change sets; only order)
+        recent = store.recent_events(user_id=user_id, limit=500)
+        cfg = PersonalizationConfig()
+        sections, personalization_dbg = reorder_only_personalize_sections(
+            sections=sections,
+            recent_events=recent,
+            user_id=user_id,
+            debug=bool(debug),
+            config=cfg,
+        )
 
-    # 3) Optional tag join across ALL rails
     tags_join_dbg: Dict[str, Any] = {}
     if include_tags:
         tag_store = _get_tag_store()
-        sections, tags_join_dbg = _attach_tags_optional(
-            sections=sections, include_tags=True, debug=bool(debug), tag_store=tag_store
-        )
+        sections, tags_join_dbg = _join_tags_into_sections(sections, tag_store, debug=bool(debug))
 
     body: Dict[str, Any] = {"ok": True, "country": country, "n": int(n), "sections": sections}
 
@@ -415,8 +399,7 @@ def feed_home(
             d["suppressed_removed_by_section"] = removed_by_section
             d["suppressed_ids_n"] = int(len(suppressed))
             d["suppressed_event_types"] = ["dislike", "skip"]
-            if personalization_dbg:
-                d["personalization"] = personalization_dbg
+            d["personalization"] = personalization_dbg
 
         if include_tags:
             d["tags_join"] = tags_join_dbg
@@ -454,29 +437,28 @@ def feed_genre(
     user_id = _clean_user_id(x_user_id)
     suppressed: set[str] = set()
     removed_by_section: Dict[str, int] = {}
+    personalization_dbg: Dict[str, Any] = {}
 
-    # 1) Suppression (dislike/skip)
     if user_id:
         suppressed = store.suppressed_track_ids(user_id=user_id, event_types=("dislike", "skip"), days=365)
         before = sections
         sections = _apply_suppression(sections, suppressed)
         removed_by_section = _suppression_removed_counts(before, sections)
 
-    # 2) Reorder-only personalization (same as /feed/home)
-    sections, personalization_dbg = _maybe_apply_reorder_only_personalization(
-        sections=sections,
-        user_id=user_id,
-        store=store,
-        debug=bool(debug),
-    )
+        recent = store.recent_events(user_id=user_id, limit=500)
+        cfg = PersonalizationConfig()
+        sections, personalization_dbg = reorder_only_personalize_sections(
+            sections=sections,
+            recent_events=recent,
+            user_id=user_id,
+            debug=bool(debug),
+            config=cfg,
+        )
 
-    # 3) Optional tag join across ALL rails
     tags_join_dbg: Dict[str, Any] = {}
     if include_tags:
         tag_store = _get_tag_store()
-        sections, tags_join_dbg = _attach_tags_optional(
-            sections=sections, include_tags=True, debug=bool(debug), tag_store=tag_store
-        )
+        sections, tags_join_dbg = _join_tags_into_sections(sections, tag_store, debug=bool(debug))
 
     body: Dict[str, Any] = {
         "ok": True,
@@ -508,6 +490,123 @@ def feed_genre(
     return body
 
 
+@router.get("/feed/mood")
+def feed_mood(
+    country: str = Query(...),
+    mood: str = Query(..., description="Mood/scene slug, e.g. late-night-chill"),
+    n: int = Query(default=10, ge=1, le=200),
+    explicit_ok: bool = Query(default=False),
+    debug: bool = Query(default=False),
+    include_tags: bool = Query(default=False),
+    pool_mult: int = Query(default=10, ge=2, le=50),
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    store: FeedbackStore = Depends(get_feedback_store),
+) -> Dict[str, Any]:
+    """
+    V1.5.1 Step 3B:
+      - Mood discovery feed (UX lift only)
+      - No ranker changes. Filtering only.
+      - Internally joins tags to filter, but response includes tags only if include_tags=true.
+    """
+    mslug = _slugify(mood)
+    if not mslug:
+        raise HTTPException(status_code=400, detail="mood is required")
+
+    feeds = _get_feeds_engine()
+
+    # Build a larger pool, then filter by mood tags
+    pool_n = min(200, max(int(n) * int(pool_mult), 25))
+    q = FeedQuery(country=country, genre=None, n=pool_n, explicit_ok=explicit_ok, debug=debug)
+    sections, base_dbg = feeds.home_feed(q)
+
+    user_id = _clean_user_id(x_user_id)
+    suppressed: set[str] = set()
+    removed_by_section: Dict[str, int] = {}
+    personalization_dbg: Dict[str, Any] = {}
+
+    # suppression + reorder-only personalization (same behavior as /feed/home)
+    if user_id:
+        suppressed = store.suppressed_track_ids(user_id=user_id, event_types=("dislike", "skip"), days=365)
+        before = sections
+        sections = _apply_suppression(sections, suppressed)
+        removed_by_section = _suppression_removed_counts(before, sections)
+
+        recent = store.recent_events(user_id=user_id, limit=500)
+        cfg = PersonalizationConfig()
+        sections, personalization_dbg = reorder_only_personalize_sections(
+            sections=sections,
+            recent_events=recent,
+            user_id=user_id,
+            debug=bool(debug),
+            config=cfg,
+        )
+
+    # Always join tags internally (needed to filter)
+    tag_store = _get_tag_store()
+    sections_with_tags, tags_join_dbg = _join_tags_into_sections(sections, tag_store, debug=bool(debug))
+
+    # Gather candidates in stable order: prefer "top" then other rails
+    candidates: List[Dict[str, Any]] = []
+    if isinstance(sections_with_tags.get("top"), list):
+        for it in sections_with_tags.get("top", []):
+            if isinstance(it, dict):
+                candidates.append(it)
+
+    for rail, items in sections_with_tags.items():
+        if rail == "top":
+            continue
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if isinstance(it, dict):
+                candidates.append(it)
+
+    # Filter by mood + de-dup by track_id
+    seen: set[str] = set()
+    mood_items: List[Dict[str, Any]] = []
+    for it in candidates:
+        tid = (it.get("track_id") or "").strip()
+        if not tid or tid in seen:
+            continue
+        if _item_has_mood(it, mslug):
+            seen.add(tid)
+            mood_items.append(it)
+        if len(mood_items) >= int(n):
+            break
+
+    # Optionally strip tag fields from response
+    out_items: List[Any] = mood_items
+    if not include_tags:
+        out_items = _strip_tag_fields_from_items(out_items)
+
+    body: Dict[str, Any] = {
+        "ok": True,
+        "country": country,
+        "mood": mslug,
+        "n": int(n),
+        "sections": {"mood": out_items},
+    }
+
+    if debug:
+        d = dict(base_dbg or {})
+        d.setdefault("fallback_used", {})
+        d["candidate_pool_n"] = int(pool_n)
+        d["returned_n"] = int(len(mood_items))
+        d["mood_filter"] = {"mood_slug": mslug}
+
+        if user_id:
+            d["disliked_suppressed_count"] = int(len(suppressed))
+            d["suppressed_removed_by_section"] = removed_by_section
+            d["suppressed_event_types"] = ["dislike", "skip"]
+            d["personalization"] = personalization_dbg
+
+        # Always show join debug since we always join internally here
+        d["tags_join"] = tags_join_dbg
+        body["debug"] = d
+
+    return body
+
+
 @router.get("/feed/for-you")
 def feed_for_you(
     country: str = Query(...),
@@ -515,8 +614,6 @@ def feed_for_you(
     explicit_ok: bool = Query(default=False),
     debug: bool = Query(default=False),
     include_tags: bool = Query(default=False),
-    # personalization knobs (for ForYou engine)
-    # personalization knobs
     candidate_k: int = Query(default=1200, ge=300, le=20000),
     same_country_only: bool = Query(default=True),
     unique_artist: bool = Query(default=True),
@@ -525,25 +622,17 @@ def feed_for_you(
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
     store: FeedbackStore = Depends(get_feedback_store),
 ) -> Dict[str, Any]:
-    """
-    V1.5.6 Step 1.2/1.3:
-      - Real ForYou engine using session feedback events as taste signals.
-      - Always returns a 'for_you' rail (may be empty, with fallback reason in debug).
-    """
     user_id = _require_user_id(x_user_id)
     feeds = _get_feeds_engine()
 
-    # Base candidate rails (kept for UX + fallback)
     q = FeedQuery(country=country, genre=None, n=n, explicit_ok=explicit_ok, debug=debug)
     sections, dbg = feeds.home_feed(q)
 
-    # Suppression (dislike/skip) applies to everything including for_you results
     suppressed = store.suppressed_track_ids(user_id=user_id, event_types=("dislike", "skip"), days=365)
     before_supp = sections
     sections = _apply_suppression(sections, suppressed)
     removed_by_section = _suppression_removed_counts(before_supp, sections)
 
-    # Build events for ForYou from recent feedback
     recent = store.recent_events(user_id=user_id, limit=500)
     events: list[SessionEvent] = []
 
@@ -554,8 +643,6 @@ def feed_for_you(
         et = (e.get("event_type") or "").strip().lower()
         if not tid or not et:
             continue
-
-        # IMPORTANT: SessionEvent requires session_id
         events.append(
             SessionEvent(
                 session_id=user_id,
@@ -565,7 +652,6 @@ def feed_for_you(
             )
         )
 
-    # Run ForYou
     for_you_items = []
     for_you_dbg: Dict[str, object] = {}
     fallback_reason: Optional[str] = None
@@ -595,15 +681,12 @@ def feed_for_you(
         except Exception:
             fallback_reason = "engine_error"
 
-    # Apply suppression to for_you rail too
     if suppressed and for_you_items:
         for_you_items = [it for it in for_you_items if it.get("track_id") not in suppressed]
 
-    # Always include for_you rail
     sections = dict(sections)
     sections["for_you"] = for_you_items[: int(n)]
 
-    # Cross-rail de-dup: remove for_you track_ids from other rails
     for_you_ids = {
         str(it.get("track_id"))
         for it in sections["for_you"]
@@ -611,13 +694,10 @@ def feed_for_you(
     }
     sections, cross_removed = _dedup_other_sections_against_for_you(sections, for_you_ids)
 
-    # Optional tag join across ALL rails (including for_you)
     tags_join_dbg: Dict[str, Any] = {}
     if include_tags:
         tag_store = _get_tag_store()
-        sections, tags_join_dbg = _attach_tags_optional(
-            sections=sections, include_tags=True, debug=bool(debug), tag_store=tag_store
-        )
+        sections, tags_join_dbg = _join_tags_into_sections(sections, tag_store, debug=bool(debug))
 
     body: Dict[str, Any] = {"ok": True, "country": country, "n": int(n), "sections": sections}
 
