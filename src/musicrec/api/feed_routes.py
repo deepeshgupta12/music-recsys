@@ -12,7 +12,10 @@ from musicrec.for_you import (
     build_for_you_recommender_from_feature_table,
     for_you_item_to_api_dict,
 )
-from musicrec.personalization import PersonalizationConfig, reorder_only_personalize_sections  # v1.5.6 Step 1.4
+from musicrec.personalization import (  # v1.5.6 Step 1.4/1.5
+    PersonalizationConfig,
+    apply_reorder_only_personalization,
+)
 from musicrec.session_store import SessionEvent
 from musicrec.storage.feedback_store import FeedbackStore
 from musicrec.storage.feature_table import load_feature_table
@@ -95,7 +98,6 @@ def _ts_to_iso(ts: Any) -> str:
         if ts is None:
             return "1970-01-01T00:00:00+00:00"
 
-        # epoch seconds -> ISO with +00:00
         if isinstance(ts, (int, float)):
             import datetime as _dt
 
@@ -105,7 +107,6 @@ def _ts_to_iso(ts: Any) -> str:
         if not s:
             return "1970-01-01T00:00:00+00:00"
 
-        # normalize trailing Z -> +00:00 for fromisoformat compatibility
         if s.endswith("Z"):
             return s[:-1] + "+00:00"
 
@@ -280,6 +281,84 @@ def _attach_tags_optional(
         }
 
     return out_sections, tags_dbg
+def _build_track_boosts_from_recent_events(recent: list[dict]) -> Tuple[Dict[str, float], int]:
+    """
+    v1.5.6 reorder-only personalization signal:
+      - derive per-track boosts from recent feedback events
+      - de-dupe by track_id and keep the max weight per track
+    Expected weights (aligned with your Step 1.4E debug samples):
+      - like -> 5.0
+      - play -> 2.0
+    """
+    weights: Dict[str, float] = {"like": 5.0, "play": 2.0}
+
+    boosts: Dict[str, float] = {}
+    for e in recent or []:
+        if not isinstance(e, dict):
+            continue
+        tid = (e.get("track_id") or "").strip()
+        et = (e.get("event_type") or "").strip().lower()
+        if not tid or not et:
+            continue
+        w = weights.get(et)
+        if w is None:
+            continue
+        prev = boosts.get(tid)
+        boosts[tid] = w if prev is None else max(prev, w)
+
+    # “recent_events_considered” in your Step 1.4E output matches unique tracks (not raw event rows)
+    considered_unique_tracks = int(len(boosts))
+    return boosts, considered_unique_tracks
+
+
+def _maybe_apply_reorder_only_personalization(
+    *,
+    sections: Dict[str, list],
+    user_id: Optional[str],
+    store: FeedbackStore,
+    debug: bool,
+) -> Tuple[Dict[str, list], Dict[str, Any]]:
+    """
+    v1.5.6 Step 1.4/1.5:
+      - reorder only (never changes set sizes)
+      - applied only when user_id is present
+      - debug dict is returned only when debug=True
+    """
+    if not user_id:
+        return sections, {}
+
+    recent = store.recent_events(user_id=user_id, limit=500)
+    track_boosts, recent_considered = _build_track_boosts_from_recent_events(recent)
+
+    section_names = [
+        k for k, v in sections.items()
+        if isinstance(v, list) and k != "for_you"
+    ]
+
+    cfg = PersonalizationConfig()
+    new_sections, ro_dbg = apply_reorder_only_personalization(
+        sections,
+        track_boosts=track_boosts,
+        section_names=section_names,
+        cfg=cfg,
+    )
+
+    if not debug:
+        return new_sections, {}
+
+    # Keep debug schema consistent with what you validated in Step 1.4E
+    sample_items = list(track_boosts.items())[:10]
+    personalization_dbg: Dict[str, Any] = {
+        "reorder_only": True,
+        "user_id": user_id,
+        "recent_events_considered": int(recent_considered),
+        "track_boosts_n": int(len(track_boosts)),
+        "track_boosts_sample": dict(sample_items),
+    }
+    if isinstance(ro_dbg, dict):
+        personalization_dbg.update(ro_dbg)
+
+    return new_sections, personalization_dbg
 
 
 @router.get("/feed/home")
@@ -300,29 +379,21 @@ def feed_home(
     user_id = _clean_user_id(x_user_id)
     suppressed: set[str] = set()
     removed_by_section: Dict[str, int] = {}
-    personalization_dbg: Dict[str, Any] = {}
 
     # 1) Suppression (dislike/skip)
     if user_id:
-        suppressed = store.suppressed_track_ids(
-            user_id=user_id,
-            event_types=("dislike", "skip"),
-            days=365,
-        )
+        suppressed = store.suppressed_track_ids(user_id=user_id, event_types=("dislike", "skip"), days=365)
         before = sections
         sections = _apply_suppression(sections, suppressed)
         removed_by_section = _suppression_removed_counts(before, sections)
 
-        # 2) Step 1.4 reorder-only personalization (DOES NOT change sets; only order)
-        recent = store.recent_events(user_id=user_id, limit=500)
-        cfg = PersonalizationConfig()  # defaults for v1.5.6 Step 1.4
-        sections, personalization_dbg = reorder_only_personalize_sections(
-            sections=sections,
-            recent_events=recent,
-            user_id=user_id,
-            debug=bool(debug),
-            config=cfg,
-        )
+    # 2) Reorder-only personalization (keeps sets intact; changes order only)
+    sections, personalization_dbg = _maybe_apply_reorder_only_personalization(
+        sections=sections,
+        user_id=user_id,
+        store=store,
+        debug=bool(debug),
+    )
 
     # 3) Optional tag join across ALL rails
     tags_join_dbg: Dict[str, Any] = {}
@@ -337,19 +408,15 @@ def feed_home(
     if debug:
         d = dict(dbg or {})
         d.setdefault("fallback_used", {})
-        d.setdefault(
-            "sections_returned",
-            {k: int(len(v)) for k, v in sections.items() if isinstance(v, list)},
-        )
+        d.setdefault("sections_returned", {k: int(len(v)) for k, v in sections.items() if isinstance(v, list)})
 
         if user_id:
             d["disliked_suppressed_count"] = int(len(suppressed))
             d["suppressed_removed_by_section"] = removed_by_section
             d["suppressed_ids_n"] = int(len(suppressed))
             d["suppressed_event_types"] = ["dislike", "skip"]
-
-            # Step 1.4 debug block
-            d["personalization"] = personalization_dbg
+            if personalization_dbg:
+                d["personalization"] = personalization_dbg
 
         if include_tags:
             d["tags_join"] = tags_join_dbg
@@ -370,18 +437,23 @@ def feed_genre(
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
     store: FeedbackStore = Depends(get_feedback_store),
 ) -> Dict[str, Any]:
+    """
+    v1.5.6 Step 1.5:
+      - Apply reorder-only personalization to the genre feed as well
+      - Suppression is applied the same way as /feed/home
+    """
     feeds = _get_feeds_engine()
 
     if not genre or not genre.strip():
         raise HTTPException(status_code=400, detail="genre is required")
 
-    q = FeedQuery(country=country, genre=genre.strip(), n=n, explicit_ok=explicit_ok, debug=debug)
+    g = genre.strip()
+    q = FeedQuery(country=country, genre=g, n=n, explicit_ok=explicit_ok, debug=debug)
     sections, dbg = feeds.genre_feed(q)
 
     user_id = _clean_user_id(x_user_id)
     suppressed: set[str] = set()
     removed_by_section: Dict[str, int] = {}
-    personalization_dbg: Dict[str, Any] = {}
 
     # 1) Suppression (dislike/skip)
     if user_id:
@@ -390,16 +462,13 @@ def feed_genre(
         sections = _apply_suppression(sections, suppressed)
         removed_by_section = _suppression_removed_counts(before, sections)
 
-        # 2) Step 1.4 reorder-only personalization
-        recent = store.recent_events(user_id=user_id, limit=500)
-        cfg = PersonalizationConfig()
-        sections, personalization_dbg = reorder_only_personalize_sections(
-            sections=sections,
-            recent_events=recent,
-            user_id=user_id,
-            debug=bool(debug),
-            config=cfg,
-        )
+    # 2) Reorder-only personalization (same as /feed/home)
+    sections, personalization_dbg = _maybe_apply_reorder_only_personalization(
+        sections=sections,
+        user_id=user_id,
+        store=store,
+        debug=bool(debug),
+    )
 
     # 3) Optional tag join across ALL rails
     tags_join_dbg: Dict[str, Any] = {}
@@ -412,7 +481,7 @@ def feed_genre(
     body: Dict[str, Any] = {
         "ok": True,
         "country": country,
-        "genre": genre.strip(),
+        "genre": g,
         "n": int(n),
         "sections": sections,
     }
@@ -428,6 +497,8 @@ def feed_genre(
             d["suppressed_ids_n"] = int(len(suppressed))
             d["suppressed_event_types"] = ["dislike", "skip"]
             d["personalization"] = personalization_dbg
+            if personalization_dbg:
+                d["personalization"] = personalization_dbg
 
         if include_tags:
             d["tags_join"] = tags_join_dbg
@@ -445,6 +516,7 @@ def feed_for_you(
     debug: bool = Query(default=False),
     include_tags: bool = Query(default=False),
     # personalization knobs (for ForYou engine)
+    # personalization knobs
     candidate_k: int = Query(default=1200, ge=300, le=20000),
     same_country_only: bool = Query(default=True),
     unique_artist: bool = Query(default=True),
@@ -454,8 +526,9 @@ def feed_for_you(
     store: FeedbackStore = Depends(get_feedback_store),
 ) -> Dict[str, Any]:
     """
-    V1.5.6 Step 1.2: Real ForYou engine using session feedback events as taste signals.
-    Always returns a 'for_you' rail (may be empty, with fallback reason in debug).
+    V1.5.6 Step 1.2/1.3:
+      - Real ForYou engine using session feedback events as taste signals.
+      - Always returns a 'for_you' rail (may be empty, with fallback reason in debug).
     """
     user_id = _require_user_id(x_user_id)
     feeds = _get_feeds_engine()
