@@ -1,43 +1,41 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from functools import lru_cache
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
-from musicrec.storage.tag_store import TagStore
+from musicrec.storage.tag_store import TagRow, TagStore, TagStoreConfig
 
-router = APIRouter(tags=["tags"])
+router = APIRouter()
+
+
+@lru_cache(maxsize=1)
+def _get_store() -> TagStore:
+    # Default store (repo-level sqlite)
+    return TagStore(TagStoreConfig())
 
 
 def get_tag_store() -> TagStore:
-    return TagStore()
+    return _get_store()
 
 
 @router.get("/tags/stats")
 def tags_stats(store: TagStore = Depends(get_tag_store)) -> Dict[str, Any]:
-    """
-    Test expectation (tests/test_api_tags.py):
-      - status 200
-      - JSON has top-level keys: "rows", "last_updated_at"
-    """
-    stats = store.stats()
-    # Put rows + last_updated_at at TOP LEVEL (no nesting).
-    return {"ok": True, **stats}
+    # IMPORTANT: tests expect rows/last_updated_at at top-level (not nested in {"ok":..., "stats":...})
+    return store.stats()
 
 
 @router.get("/tags/track/{track_id}")
 def tags_track(track_id: str, store: TagStore = Depends(get_tag_store)) -> Dict[str, Any]:
     row = store.get(track_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="tags not found for track_id")
+    if row is None:
+        raise HTTPException(status_code=404, detail="track_id not found")
     return {
-        "ok": True,
-        "item": {
-            "track_id": row.track_id,
-            "provider": row.provider,
-            "tags": row.tags,
-            "updated_at": row.updated_at,
-        },
+        "track_id": row.track_id,
+        "provider": row.provider,
+        "tags": row.tags,
+        "updated_at": row.updated_at,
     }
 
 
@@ -47,37 +45,36 @@ def tags_batch(
     include_missing: bool = Query(default=False),
     store: TagStore = Depends(get_tag_store),
 ) -> Dict[str, Any]:
-    """
-    Always returns 200 with stable structure.
-
-    If include_missing=true:
-      - missing ids are included in `missing`
-      - items includes {"track_id": "...", "missing": true} for those ids
-    """
     ids = [str(t).strip() for t in (track_id or []) if str(t).strip()]
     if not ids:
         raise HTTPException(status_code=400, detail="at least one track_id is required")
 
-    rows = store.batch_get(ids)
-    found = {r.track_id: r for r in rows}
+    found = store.batch_get(ids)
 
     items: List[Dict[str, Any]] = []
     missing: List[str] = []
 
     for tid in ids:
         r = found.get(tid)
-        if r:
+        if r is None:
+            missing.append(tid)
+            if include_missing:
+                items.append({"track_id": tid, "missing": True})
+        else:
             items.append(
                 {
                     "track_id": r.track_id,
                     "provider": r.provider,
                     "tags": r.tags,
                     "updated_at": r.updated_at,
+                    "missing": False,
                 }
             )
-        else:
-            missing.append(tid)
-            if include_missing:
-                items.append({"track_id": tid, "missing": True})
 
-    return {"ok": True, "items": items, "missing": missing}
+    return {
+        "ok": True,
+        "items": items,
+        "missing": missing,
+        "requested": len(ids),
+        "found": len(found),
+    }
