@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
@@ -19,6 +19,7 @@ from musicrec.personalization import (  # v1.5.6 Step 1.4/1.5
 from musicrec.session_store import SessionEvent
 from musicrec.storage.feedback_store import FeedbackStore
 from musicrec.storage.feature_table import load_feature_table
+from musicrec.storage.tag_store import TagStore
 
 router = APIRouter(tags=["feeds"])
 
@@ -33,6 +34,12 @@ def _get_feeds_engine() -> SegmentFeeds:
 def _get_for_you_engine():
     ft = load_feature_table()
     return build_for_you_recommender_from_feature_table(ft)
+
+
+@lru_cache(maxsize=1)
+def _get_tag_store() -> TagStore:
+    # Uses repo default tag DB path/config in TagStore
+    return TagStore()
 
 
 def _clean_user_id(x_user_id: Optional[str]) -> Optional[str]:
@@ -138,6 +145,142 @@ def _dedup_other_sections_against_for_you(
     return out, removed
 
 
+def _collect_track_ids_and_items_seen(sections: Dict[str, Any]) -> Tuple[List[str], int]:
+    """
+    Returns:
+      - unique_track_ids: unique track_id values seen across ALL list rails (dict items only)
+      - total_items_seen: total count of dict items across ALL list rails
+    """
+    ids: List[str] = []
+    seen: set[str] = set()
+    total_items_seen = 0
+
+    for _, items in (sections or {}).items():
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            total_items_seen += 1
+            tid = (it.get("track_id") or "").strip()
+            if not tid:
+                continue
+            if tid not in seen:
+                seen.add(tid)
+                ids.append(tid)
+
+    return ids, total_items_seen
+
+
+def _row_to_tags_payload(row: Any) -> Tuple[Dict[str, Any], Optional[str], Optional[float]]:
+    """
+    TagStore rows may be dataclasses/objects or dicts.
+    Normalize extraction into: (tags_dict, provider, updated_at)
+    """
+    if row is None:
+        return {}, None, None
+
+    # object-like
+    tags = getattr(row, "tags", None)
+    provider = getattr(row, "provider", None)
+    updated_at = getattr(row, "updated_at", None)
+
+    # dict-like fallback
+    if tags is None and isinstance(row, dict):
+        tags = row.get("tags")
+        provider = provider or row.get("provider")
+        updated_at = updated_at or row.get("updated_at")
+
+    if tags is None:
+        tags = {}
+    if not isinstance(tags, dict):
+        tags = {}
+
+    try:
+        updated_at_f = float(updated_at) if updated_at is not None else None
+    except Exception:
+        updated_at_f = None
+
+    provider_s = str(provider) if provider is not None else None
+    return tags, provider_s, updated_at_f
+
+
+def _attach_tags_optional(
+    sections: Dict[str, Any],
+    include_tags: bool,
+    debug: bool,
+    tag_store: TagStore,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    If include_tags=true:
+      - Adds fields on each dict item:
+          tags, tags_missing, tags_provider, tags_updated_at
+      - Returns tags_join debug block with correct counters:
+          tracks_requested = unique track_ids seen across ALL rails
+    """
+    if not include_tags:
+        return sections, {}
+
+    # 1) Collect universe across ALL rails
+    ids, total_items_seen = _collect_track_ids_and_items_seen(sections)
+    tracks_requested = len(ids)
+
+    # 2) Lookup (even if result is empty, tracks_requested is still correct)
+    found_map: Dict[str, Any] = {}
+    if ids:
+        found_map = tag_store.batch_get(ids)  # contract: dict(track_id -> row/bundle)
+
+    unique_found = len(found_map or {})
+
+    # 3) Attach tags fields (copy item dicts to avoid mutating shared/cached objects)
+    tagged_items = 0
+    out_sections: Dict[str, Any] = {}
+
+    for rail, items in (sections or {}).items():
+        if not isinstance(items, list):
+            out_sections[rail] = items
+            continue
+
+        new_items: list = []
+        for it in items:
+            if not isinstance(it, dict):
+                new_items.append(it)
+                continue
+
+            tid = (it.get("track_id") or "").strip()
+            row = found_map.get(tid) if tid else None
+            tags, provider, updated_at = _row_to_tags_payload(row)
+
+            it2 = dict(it)
+            if row is None:
+                it2["tags"] = {}
+                it2["tags_missing"] = True
+                it2["tags_provider"] = None
+                it2["tags_updated_at"] = None
+            else:
+                it2["tags"] = tags
+                it2["tags_missing"] = False
+                it2["tags_provider"] = provider
+                it2["tags_updated_at"] = updated_at
+                tagged_items += 1
+
+            new_items.append(it2)
+
+        out_sections[rail] = new_items
+
+    missing_items = max(0, int(total_items_seen) - int(tagged_items))
+
+    tags_dbg = {}
+    if debug:
+        tags_dbg = {
+            "tracks_requested": int(tracks_requested),      # <-- FIXED DEFINITION
+            "unique_found": int(unique_found),
+            "total_items_seen": int(total_items_seen),
+            "tagged_items": int(tagged_items),
+            "missing_items": int(missing_items),
+        }
+
+    return out_sections, tags_dbg
 def _build_track_boosts_from_recent_events(recent: list[dict]) -> Tuple[Dict[str, float], int]:
     """
     v1.5.6 reorder-only personalization signal:
@@ -224,6 +367,7 @@ def feed_home(
     n: int = Query(default=10, ge=1, le=200),
     explicit_ok: bool = Query(default=False),
     debug: bool = Query(default=False),
+    include_tags: bool = Query(default=False),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
     store: FeedbackStore = Depends(get_feedback_store),
 ) -> Dict[str, Any]:
@@ -251,6 +395,14 @@ def feed_home(
         debug=bool(debug),
     )
 
+    # 3) Optional tag join across ALL rails
+    tags_join_dbg: Dict[str, Any] = {}
+    if include_tags:
+        tag_store = _get_tag_store()
+        sections, tags_join_dbg = _attach_tags_optional(
+            sections=sections, include_tags=True, debug=bool(debug), tag_store=tag_store
+        )
+
     body: Dict[str, Any] = {"ok": True, "country": country, "n": int(n), "sections": sections}
 
     if debug:
@@ -266,6 +418,9 @@ def feed_home(
             if personalization_dbg:
                 d["personalization"] = personalization_dbg
 
+        if include_tags:
+            d["tags_join"] = tags_join_dbg
+
         body["debug"] = d
 
     return body
@@ -278,6 +433,7 @@ def feed_genre(
     n: int = Query(default=10, ge=1, le=200),
     explicit_ok: bool = Query(default=False),
     debug: bool = Query(default=False),
+    include_tags: bool = Query(default=False),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
     store: FeedbackStore = Depends(get_feedback_store),
 ) -> Dict[str, Any]:
@@ -314,6 +470,14 @@ def feed_genre(
         debug=bool(debug),
     )
 
+    # 3) Optional tag join across ALL rails
+    tags_join_dbg: Dict[str, Any] = {}
+    if include_tags:
+        tag_store = _get_tag_store()
+        sections, tags_join_dbg = _attach_tags_optional(
+            sections=sections, include_tags=True, debug=bool(debug), tag_store=tag_store
+        )
+
     body: Dict[str, Any] = {
         "ok": True,
         "country": country,
@@ -332,8 +496,12 @@ def feed_genre(
             d["suppressed_removed_by_section"] = removed_by_section
             d["suppressed_ids_n"] = int(len(suppressed))
             d["suppressed_event_types"] = ["dislike", "skip"]
+            d["personalization"] = personalization_dbg
             if personalization_dbg:
                 d["personalization"] = personalization_dbg
+
+        if include_tags:
+            d["tags_join"] = tags_join_dbg
 
         body["debug"] = d
 
@@ -346,6 +514,8 @@ def feed_for_you(
     n: int = Query(default=10, ge=5, le=200),
     explicit_ok: bool = Query(default=False),
     debug: bool = Query(default=False),
+    include_tags: bool = Query(default=False),
+    # personalization knobs (for ForYou engine)
     # personalization knobs
     candidate_k: int = Query(default=1200, ge=300, le=20000),
     same_country_only: bool = Query(default=True),
@@ -441,6 +611,14 @@ def feed_for_you(
     }
     sections, cross_removed = _dedup_other_sections_against_for_you(sections, for_you_ids)
 
+    # Optional tag join across ALL rails (including for_you)
+    tags_join_dbg: Dict[str, Any] = {}
+    if include_tags:
+        tag_store = _get_tag_store()
+        sections, tags_join_dbg = _attach_tags_optional(
+            sections=sections, include_tags=True, debug=bool(debug), tag_store=tag_store
+        )
+
     body: Dict[str, Any] = {"ok": True, "country": country, "n": int(n), "sections": sections}
 
     if debug:
@@ -460,6 +638,9 @@ def feed_for_you(
             "for_you_debug": for_you_dbg,
             "dedup_removed_against_for_you": cross_removed,
         }
+
+        if include_tags:
+            d["tags_join"] = tags_join_dbg
 
         body["debug"] = d
 
