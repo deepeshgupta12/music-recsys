@@ -1,42 +1,33 @@
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
-from musicrec.storage.tag_store import TagRow, TagStore, TagStoreConfig
-
-router = APIRouter()
+from musicrec.storage.tag_store import TagStore, TagStoreConfig
 
 
-@lru_cache(maxsize=1)
-def _get_store() -> TagStore:
-    # Default store (repo-level sqlite)
-    return TagStore(TagStoreConfig())
+router = APIRouter(tags=["tags"])
 
 
 def get_tag_store() -> TagStore:
-    return _get_store()
+    # Default matches tagging script runtime DB
+    return TagStore(TagStoreConfig())
 
 
 @router.get("/tags/stats")
 def tags_stats(store: TagStore = Depends(get_tag_store)) -> Dict[str, Any]:
-    # IMPORTANT: tests expect rows/last_updated_at at top-level (not nested in {"ok":..., "stats":...})
+    # Tests expect a FLAT payload: {"rows": ..., "last_updated_at": ...}
     return store.stats()
 
 
 @router.get("/tags/track/{track_id}")
 def tags_track(track_id: str, store: TagStore = Depends(get_tag_store)) -> Dict[str, Any]:
-    row = store.get(track_id)
-    if row is None:
+    b = store.get(track_id)
+    if b is None:
         raise HTTPException(status_code=404, detail="track_id not found")
-    return {
-        "track_id": row.track_id,
-        "provider": row.provider,
-        "tags": row.tags,
-        "updated_at": row.updated_at,
-    }
+    # Stable structure: always return bundle dict
+    return b.to_dict()
 
 
 @router.get("/tags/batch")
@@ -49,32 +40,26 @@ def tags_batch(
     if not ids:
         raise HTTPException(status_code=400, detail="at least one track_id is required")
 
-    found = store.batch_get(ids)
+    found = store.batch_get(ids)  # dict(track_id -> TrackTagBundle)
 
     items: List[Dict[str, Any]] = []
     missing: List[str] = []
 
     for tid in ids:
-        r = found.get(tid)
-        if r is None:
+        b = found.get(tid)
+        if b is None:
             missing.append(tid)
             if include_missing:
                 items.append({"track_id": tid, "missing": True})
         else:
-            items.append(
-                {
-                    "track_id": r.track_id,
-                    "provider": r.provider,
-                    "tags": r.tags,
-                    "updated_at": r.updated_at,
-                    "missing": False,
-                }
-            )
+            d = b.to_dict()
+            d["missing"] = False
+            items.append(d)
 
     return {
-        "ok": True,
         "items": items,
         "missing": missing,
         "requested": len(ids),
         "found": len(found),
+        "include_missing": bool(include_missing),
     }
