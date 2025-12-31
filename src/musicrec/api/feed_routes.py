@@ -16,7 +16,7 @@ from musicrec.personalization import PersonalizationConfig, reorder_only_persona
 from musicrec.session_store import SessionEvent
 from musicrec.storage.feature_table import load_feature_table
 from musicrec.storage.feedback_store import FeedbackStore
-from musicrec.storage.tag_store import TagStore
+from musicrec.storage.tag_store import TagStore, TagStoreConfig  # <-- Step 3.1: import config
 
 router = APIRouter(tags=["feeds"])
 
@@ -35,7 +35,8 @@ def _get_for_you_engine():
 
 @lru_cache(maxsize=1)
 def _get_tag_store() -> TagStore:
-    return TagStore()
+    # Step 3.1: align with tag_routes.py (same config/path/table)
+    return TagStore(TagStoreConfig())
 
 
 def _clean_user_id(x_user_id: Optional[str]) -> Optional[str]:

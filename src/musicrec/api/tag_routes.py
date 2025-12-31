@@ -71,6 +71,40 @@ def _extract_multi(tags: Dict[str, Any], keys: List[str]) -> List[str]:
     return out
 
 
+def _row_get_value(row: Any, col: str, idx: int = 0) -> Any:
+    """
+    Step 3.1: sqlite can return rows as:
+      - dict/RowMapping (supports .get or __getitem__ by key)
+      - sqlite3.Row (supports row["col"])
+      - tuple/list (positional)
+    We need to support all without blowing up.
+    """
+    if row is None:
+        return None
+
+    # mapping-like
+    try:
+        if hasattr(row, "get"):
+            return row.get(col)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    # key indexing (sqlite3.Row supports this)
+    try:
+        return row[col]  # type: ignore[index]
+    except Exception:
+        pass
+
+    # tuple/list positional fallback
+    try:
+        if isinstance(row, (tuple, list)) and len(row) > idx:
+            return row[idx]
+    except Exception:
+        pass
+
+    return None
+
+
 def _facet_counts_from_store(
     store: TagStore,
     *,
@@ -105,7 +139,6 @@ def _facet_counts_from_store(
             # discover columns
             cols: List[str] = []
             try:
-                # PRAGMA table_info returns rows with "name"
                 cols = [r["name"] for r in con.execute(f"PRAGMA table_info({table_name})").fetchall()]
             except Exception:
                 cols = []
@@ -125,13 +158,15 @@ def _facet_counts_from_store(
 
             limit_sql = f" LIMIT {int(max_rows)}" if int(max_rows) > 0 else ""
 
-            # keep select minimal
+            # keep select minimal (ONE column) so tuple rows are safe at index 0
             q = f"SELECT {tags_col} FROM {table_name}{where}{limit_sql}"
             rows = con.execute(q, tuple(params)).fetchall()
 
             for r in rows:
                 rows_scanned += 1
-                raw = r.get(tags_col)
+
+                # Step 3.1 FIX: row-safe extraction across tuple/Row/dict
+                raw = _row_get_value(r, tags_col, 0)
                 if not raw:
                     continue
 
