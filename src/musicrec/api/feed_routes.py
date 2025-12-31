@@ -326,6 +326,45 @@ def _strip_tag_fields_from_items(items: List[Any]) -> List[Any]:
     return out
 
 
+def _stable_candidates_from_sections(sections_with_tags: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Stable order:
+      - "top" rail first (if present)
+      - then other rails in insertion order
+    """
+    candidates: List[Dict[str, Any]] = []
+
+    if isinstance(sections_with_tags.get("top"), list):
+        for it in sections_with_tags.get("top", []):
+            if isinstance(it, dict):
+                candidates.append(it)
+
+    for rail, items in sections_with_tags.items():
+        if rail == "top":
+            continue
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if isinstance(it, dict):
+                candidates.append(it)
+
+    return candidates
+
+
+def _dedup_items_by_track_id(items: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    seen: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        tid = (it.get("track_id") or "").strip()
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        out.append(it)
+        if len(out) >= int(limit):
+            break
+    return out
+
+
 @router.get("/feed/home")
 def feed_home(
     country: str = Query(...),
@@ -479,14 +518,16 @@ def feed_mood(
     explicit_ok: bool = Query(default=False),
     debug: bool = Query(default=False),
     include_tags: bool = Query(default=False),
+    fallback: bool = Query(default=True, description="If true, return fallback rail when no mood matches"),
     pool_mult: int = Query(default=10, ge=2, le=50),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
     store: FeedbackStore = Depends(get_feedback_store),
 ) -> Dict[str, Any]:
     """
-    V1.5.1 Step 3B:
+    v1.5.1 Step 4:
       - Mood discovery feed (UX lift only)
       - No ranker changes. Filtering only.
+      - If no mood matches, fallback to a non-empty rail (default: enabled).
       - Internally joins tags to filter, but response includes tags only if include_tags=true.
     """
     mslug = _slugify(mood)
@@ -526,21 +567,7 @@ def feed_mood(
     tag_store = _get_tag_store()
     sections_with_tags, tags_join_dbg = _join_tags_into_sections(sections, tag_store, debug=bool(debug))
 
-    # Gather candidates in stable order: prefer "top" then other rails
-    candidates: List[Dict[str, Any]] = []
-    if isinstance(sections_with_tags.get("top"), list):
-        for it in sections_with_tags.get("top", []):
-            if isinstance(it, dict):
-                candidates.append(it)
-
-    for rail, items in sections_with_tags.items():
-        if rail == "top":
-            continue
-        if not isinstance(items, list):
-            continue
-        for it in items:
-            if isinstance(it, dict):
-                candidates.append(it)
+    candidates = _stable_candidates_from_sections(sections_with_tags)
 
     # Filter by mood + de-dup by track_id
     seen: set[str] = set()
@@ -554,6 +581,17 @@ def feed_mood(
             mood_items.append(it)
         if len(mood_items) >= int(n):
             break
+
+    fallback_used = False
+    fallback_reason: Optional[str] = None
+
+    if len(mood_items) == 0:
+        fallback_reason = "no_mood_matches"
+        if bool(fallback):
+            fallback_used = True
+            mood_items = _dedup_items_by_track_id(candidates, limit=int(n))
+            if len(mood_items) == 0:
+                fallback_reason = "no_candidates"
 
     # Optionally strip tag fields from response
     out_items: List[Any] = mood_items
@@ -573,7 +611,12 @@ def feed_mood(
         d.setdefault("fallback_used", {})
         d["candidate_pool_n"] = int(pool_n)
         d["returned_n"] = int(len(mood_items))
-        d["mood_filter"] = {"mood_slug": mslug}
+        d["mood_filter"] = {
+            "mood_slug": mslug,
+            "fallback_param": bool(fallback),
+            "fallback_used": bool(fallback_used),
+            "fallback_reason": fallback_reason,
+        }
 
         if user_id:
             d["disliked_suppressed_count"] = int(len(suppressed))
