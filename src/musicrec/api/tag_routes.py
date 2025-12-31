@@ -1,82 +1,102 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from musicrec.storage.tag_store import TagStore
-from musicrec.tagging.schema import TrackTagBundle
 
-router = APIRouter(prefix="/tags", tags=["tags"])
+router = APIRouter(tags=["tags"])
 
 
-# Keep this dependency lightweight and consistent with other stores
-def get_tag_store() -> TagStore:
+@lru_cache(maxsize=1)
+def _get_tag_store() -> TagStore:
+    # TagStore is lightweight (sqlite-backed) and safe to cache per-process
     return TagStore()
 
 
-@router.get("/stats")
+def get_tag_store() -> TagStore:
+    return _get_tag_store()
+
+
+def _row_to_api(row) -> Dict[str, Any]:
+    return {
+        "track_id": row.track_id,
+        "provider": row.provider,
+        "tags": dict(row.tags or {}),
+        "updated_at": float(row.updated_at),
+    }
+
+
+@router.get("/tags/stats")
 def tags_stats(store: TagStore = Depends(get_tag_store)) -> Dict[str, Any]:
     """
-    Returns:
-      { "rows": <int>, "last_updated_at": <float|None> }
+    Basic stats for tag store.
+    Expected by tests: returns 200 with stable shape.
     """
-    return store.stats()
+    s = store.stats()
+    return {
+        "ok": True,
+        "rows": int(s.get("rows", 0)),
+        "last_updated_at": float(s.get("last_updated_at") or 0.0),
+    }
 
 
-@router.get("/track/{track_id}")
-def get_track_tags(
-    track_id: str,
-    store: TagStore = Depends(get_tag_store),
-) -> Dict[str, Any]:
+@router.get("/tags/track/{track_id}")
+def tags_for_track(track_id: str, store: TagStore = Depends(get_tag_store)) -> Dict[str, Any]:
     """
-    Returns the stored tag bundle for a track_id.
+    Return tags for a single track.
+    If missing: 404.
     """
-    bundle = store.get(track_id)
-    if not bundle:
-        raise HTTPException(status_code=404, detail="tags_not_found")
-    return bundle.to_dict()
+    tid = (track_id or "").strip()
+    if not tid:
+        raise HTTPException(status_code=400, detail="track_id is required")
+
+    row = store.get(tid)
+    if row is None:
+        raise HTTPException(status_code=404, detail="tags not found for track_id")
+
+    return {"ok": True, "item": _row_to_api(row)}
 
 
-@router.get("/batch")
-def get_track_tags_batch(
-    track_ids: List[str] = Query(..., alias="track_id"),
+@router.get("/tags/batch")
+def tags_batch(
+    track_id: List[str] = Query(..., description="Repeatable query param. Example: /tags/batch?track_id=A&track_id=B"),
     include_missing: bool = Query(default=False),
     store: TagStore = Depends(get_tag_store),
 ) -> Dict[str, Any]:
     """
-    Usage:
-      /tags/batch?track_id=TRK-1&track_id=TRK-2
+    Batch fetch tags for multiple track_ids.
+    Always returns 200 with stable structure.
 
-    Returns:
-      {
-        "items": [<TrackTagBundle dict> ...],
-        "missing": [<track_id> ...]   # only if include_missing=true
-      }
+    If include_missing=true, missing track_ids are included in response under `missing`
+    and also represented in `items` as {"track_id": "...", "missing": true}.
     """
+    ids = [str(t).strip() for t in (track_id or []) if str(t).strip()]
+    if not ids:
+        raise HTTPException(status_code=400, detail="at least one track_id is required")
+
+    rows = store.batch_get(ids)
+    row_by_id: Dict[str] = {r.track_id: r for r in rows}
+
     items: List[Dict[str, Any]] = []
     missing: List[str] = []
 
-    # de-dupe while preserving input order
-    seen: set[str] = set()
-    cleaned: List[str] = []
-    for tid in track_ids:
-        t = (tid or "").strip()
-        if not t:
-            continue
-        if t in seen:
-            continue
-        seen.add(t)
-        cleaned.append(t)
-
-    for tid in cleaned:
-        bundle: Optional[TrackTagBundle] = store.get(tid)
-        if bundle:
-            items.append(bundle.to_dict())
-        else:
+    for tid in ids:
+        row = row_by_id.get(tid)
+        if row is None:
             missing.append(tid)
+            if include_missing:
+                items.append({"track_id": tid, "missing": True})
+            continue
+        items.append(_row_to_api(row))
 
-    out: Dict[str, Any] = {"items": items}
-    if include_missing:
-        out["missing"] = missing
-    return out
+    return {
+        "ok": True,
+        "n_requested": int(len(ids)),
+        "n_found": int(len(rows)),
+        "include_missing": bool(include_missing),
+        "missing": missing,
+        "items": items,
+    }

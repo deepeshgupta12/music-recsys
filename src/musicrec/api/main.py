@@ -11,6 +11,7 @@ from typing import List, Any, Dict, Optional, Tuple
 from musicrec.faiss_ann import FaissANN
 from musicrec.api.feed_routes import router as feed_router
 from musicrec.api.feedback_routes import router as feedback_router
+from musicrec.api.tag_routes import router as tag_router
 
 import numpy as np
 import pandas as pd
@@ -20,6 +21,7 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="music-recsys API", version="1.3.1")
 app.include_router(feed_router)
 app.include_router(feedback_router)
+app.include_router(tag_router)
 _STARTED_AT = datetime.now(timezone.utc)
 
 
