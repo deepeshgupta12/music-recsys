@@ -5,242 +5,206 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 
 @dataclass(frozen=True)
 class TagStoreConfig:
-    db_path: Optional[Union[str, Path]] = None
+    """
+    Storage config for tags.
+    db_path can be a string path (tests pass a temp path string) or a Path.
+    """
+    db_path: Union[str, Path, None] = None
     table_name: str = "tags"
 
 
-@dataclass(frozen=True)
-class TagRow:
-    track_id: str
-    provider: str
-    tags: Dict[str, Any]
-    updated_at: float
+def _repo_root() -> Path:
+    """
+    Best-effort repo root discovery.
+    Falls back to 3 levels above this file (src/musicrec/storage).
+    """
+    here = Path(__file__).resolve()
+    for p in [here] + list(here.parents):
+        if (p / "pyproject.toml").exists() or (p / ".git").exists():
+            return p
+    return here.parents[3] if len(here.parents) >= 4 else here.parent
+
+
+def _bundle_to_dict(bundle: Any) -> Dict[str, Any]:
+    """
+    Convert TrackTagBundle-like objects to dict for persistence.
+    Supports:
+      - .to_dict()
+      - .dict() (pydantic)
+      - dataclass asdict-compatible via __dict__ fallback
+      - already-a-dict
+    """
+    if bundle is None:
+        return {}
+
+    if isinstance(bundle, dict):
+        return bundle
+
+    to_dict = getattr(bundle, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+
+    pyd_dict = getattr(bundle, "dict", None)
+    if callable(pyd_dict):
+        return pyd_dict()
+
+    # Fallback (works for simple dataclasses / objects)
+    d = getattr(bundle, "__dict__", None)
+    if isinstance(d, dict):
+        return dict(d)
+
+    raise TypeError(f"Unsupported tag bundle type: {type(bundle)}")
 
 
 class TagStore:
     """
-    SQLite-backed store for per-track tagging bundles.
+    SQLite-backed store for TrackTagBundle JSON payloads.
 
-    This store is intentionally permissive about input types:
-    - TagRow
-    - "TrackTagBundle"-like objects (from heuristic tagger)
-    - dict payloads
-
-    It normalizes into TagRow and persists:
-      track_id (PK), provider, tags_json, updated_at
+    Schema:
+      track_id TEXT PRIMARY KEY
+      provider TEXT
+      payload_json TEXT
+      updated_at REAL
     """
 
     def __init__(self, cfg: Optional[TagStoreConfig] = None) -> None:
         self.cfg = cfg or TagStoreConfig()
-        db_path: Path
 
         if self.cfg.db_path is None:
-            db_path = self._repo_root() / "data" / "tags.sqlite3"
+            db_path = _repo_root() / "data" / "tags.sqlite3"
         else:
-            db_path = Path(self.cfg.db_path)  # IMPORTANT: accept string paths from tests
+            db_path = Path(self.cfg.db_path) if not isinstance(self.cfg.db_path, Path) else self.cfg.db_path
 
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._db_path = db_path
+        self.db_path: Path = db_path
+
         self._ensure_schema()
 
-    def _repo_root(self) -> Path:
-        """
-        Resolve repo root by walking upwards until we find .git or pyproject.toml.
-        Falls back to 4 levels up from this file (src/musicrec/storage/tag_store.py -> repo).
-        """
-        here = Path(__file__).resolve()
-        for p in [here] + list(here.parents):
-            if (p / ".git").exists() or (p / "pyproject.toml").exists():
-                return p
-        # fallback: .../src/musicrec/storage/tag_store.py -> parents[4] ~ repo
-        try:
-            return here.parents[4]
-        except Exception:
-            return Path.cwd()
-
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self._db_path))
-        conn.row_factory = sqlite3.Row
-        return conn
+        con = sqlite3.connect(str(self.db_path))
+        con.row_factory = sqlite3.Row
+        return con
 
     def _ensure_schema(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
+        with self._connect() as con:
+            con.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {self.cfg.table_name} (
-                    track_id   TEXT PRIMARY KEY,
-                    provider   TEXT NOT NULL,
-                    tags_json  TEXT NOT NULL,
+                    track_id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
                     updated_at REAL NOT NULL
-                );
+                )
                 """
             )
-            conn.execute(
-                f"CREATE INDEX IF NOT EXISTS idx_{self.cfg.table_name}_updated_at ON {self.cfg.table_name}(updated_at);"
-            )
-            conn.commit()
-
-    # -------------------------
-    # Public API
-    # -------------------------
+            con.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.cfg.table_name}_updated_at ON {self.cfg.table_name}(updated_at)")
+            con.commit()
 
     def stats(self) -> Dict[str, Any]:
-        with self._connect() as conn:
-            row = conn.execute(
-                f"SELECT COUNT(*) AS n, COALESCE(MAX(updated_at), 0.0) AS mx FROM {self.cfg.table_name};"
+        with self._connect() as con:
+            row = con.execute(
+                f"SELECT COUNT(*) AS n, COALESCE(MAX(updated_at), 0.0) AS last FROM {self.cfg.table_name}"
             ).fetchone()
-        return {"rows": int(row["n"]), "last_updated_at": float(row["mx"])}
+        return {"rows": int(row["n"]), "last_updated_at": float(row["last"])}
 
-    def get(self, track_id: str) -> Optional[TagRow]:
-        tid = str(track_id).strip()
-        if not tid:
-            return None
-        with self._connect() as conn:
-            r = conn.execute(
-                f"SELECT track_id, provider, tags_json, updated_at FROM {self.cfg.table_name} WHERE track_id = ?;",
-                (tid,),
-            ).fetchone()
-        if not r:
-            return None
-        return TagRow(
-            track_id=str(r["track_id"]),
-            provider=str(r["provider"]),
-            tags=json.loads(r["tags_json"]) if r["tags_json"] else {},
-            updated_at=float(r["updated_at"]),
-        )
+    def upsert(self, bundle: Any, provider: str = "heuristic", updated_at: Optional[float] = None) -> None:
+        self.upsert_many([bundle], provider=provider, updated_at=updated_at)
 
-    def batch_get(self, track_ids: Sequence[str]) -> Dict[str, TagRow]:
-        ids = [str(x).strip() for x in (track_ids or []) if str(x).strip()]
-        if not ids:
-            return {}
-        qmarks = ",".join(["?"] * len(ids))
-        out: Dict[str, TagRow] = {}
-        with self._connect() as conn:
-            rows = conn.execute(
-                f"SELECT track_id, provider, tags_json, updated_at FROM {self.cfg.table_name} WHERE track_id IN ({qmarks});",
-                tuple(ids),
-            ).fetchall()
-        for r in rows:
-            tr = TagRow(
-                track_id=str(r["track_id"]),
-                provider=str(r["provider"]),
-                tags=json.loads(r["tags_json"]) if r["tags_json"] else {},
-                updated_at=float(r["updated_at"]),
-            )
-            out[tr.track_id] = tr
-        return out
+    def upsert_many(
+        self,
+        bundles: Iterable[Any],
+        provider: str = "heuristic",
+        updated_at: Optional[float] = None,
+    ) -> None:
+        ts = float(updated_at) if updated_at is not None else float(time.time())
 
-    def upsert(self, row: Any) -> None:
-        self.upsert_many([row])
+        payload: List[tuple] = []
+        for b in bundles:
+            d = _bundle_to_dict(b)
+            track_id = str(d.get("track_id", "")).strip()
+            if not track_id:
+                # skip invalid
+                continue
 
-    def upsert_many(self, rows: Iterable[Any]) -> None:
-        normalized: List[TagRow] = [self._coerce_to_tag_row(r) for r in rows]
-        payload: List[Tuple[str, str, str, float]] = [
-            (
-                r.track_id,
-                r.provider,
-                json.dumps(r.tags, ensure_ascii=False),
-                float(r.updated_at),
-            )
-            for r in normalized
-        ]
-        with self._connect() as conn:
-            conn.executemany(
+            # Prefer provider embedded in bundle if present, else passed provider
+            prov = d.get("provider") or getattr(b, "provider", None) or provider
+            prov = str(prov)
+
+            payload_json = json.dumps(d, ensure_ascii=False)
+            # updated_at: prefer bundle updated_at if present and numeric
+            b_ts = d.get("updated_at") or getattr(b, "updated_at", None)
+            try:
+                row_ts = float(b_ts) if b_ts is not None else ts
+            except Exception:
+                row_ts = ts
+
+            payload.append((track_id, prov, payload_json, row_ts))
+
+        if not payload:
+            return
+
+        with self._connect() as con:
+            con.executemany(
                 f"""
-                INSERT INTO {self.cfg.table_name} (track_id, provider, tags_json, updated_at)
+                INSERT INTO {self.cfg.table_name} (track_id, provider, payload_json, updated_at)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(track_id) DO UPDATE SET
-                    provider   = excluded.provider,
-                    tags_json  = excluded.tags_json,
-                    updated_at = excluded.updated_at;
+                    provider=excluded.provider,
+                    payload_json=excluded.payload_json,
+                    updated_at=excluded.updated_at
                 """,
                 payload,
             )
-            conn.commit()
+            con.commit()
 
-    # -------------------------
-    # Normalization helpers
-    # -------------------------
+    def get(self, track_id: str) -> Optional[Any]:
+        tid = str(track_id).strip()
+        if not tid:
+            return None
 
-    def _coerce_to_tag_row(self, obj: Any) -> TagRow:
-        """
-        Accept:
-          - TagRow
-          - dict
-          - TrackTagBundle-like objects
+        with self._connect() as con:
+            row = con.execute(
+                f"SELECT payload_json FROM {self.cfg.table_name} WHERE track_id = ?",
+                (tid,),
+            ).fetchone()
 
-        Expected minimum: track_id must exist.
-        """
-        if isinstance(obj, TagRow):
-            return obj
+        if row is None:
+            return None
 
-        # dict input
-        if isinstance(obj, dict):
-            track_id = str(obj.get("track_id", "")).strip()
-            if not track_id:
-                raise ValueError("TagStore.upsert: dict row missing track_id")
+        data = json.loads(row["payload_json"])
 
-            provider = (
-                obj.get("provider")
-                or obj.get("source")
-                or obj.get("model_id")
-                or obj.get("tagger")
-                or "heuristic"
-            )
-            provider = str(provider).strip() or "heuristic"
+        # Return TrackTagBundle instance if available (tests expect .instrumental_label etc.)
+        try:
+            from musicrec.tagging.schema import TrackTagBundle  # type: ignore
+            return TrackTagBundle.from_dict(data)
+        except Exception:
+            # Fallback: return raw dict if schema import isn't available
+            return data
 
-            tags_val = obj.get("tags")
-            if tags_val is None:
-                # If dict is itself a "bundle", store full dict as tags
-                tags_val = obj
-            if not isinstance(tags_val, dict):
-                # last resort: wrap
-                tags_val = {"value": tags_val}
+    def batch_get(self, track_ids: List[str]) -> Dict[str, Any]:
+        ids = [str(t).strip() for t in (track_ids or []) if str(t).strip()]
+        if not ids:
+            return {}
 
-            updated_at = obj.get("updated_at") or obj.get("created_at") or time.time()
-            return TagRow(track_id=track_id, provider=provider, tags=tags_val, updated_at=float(updated_at))
+        placeholders = ",".join(["?"] * len(ids))
+        with self._connect() as con:
+            rows = con.execute(
+                f"SELECT track_id, payload_json FROM {self.cfg.table_name} WHERE track_id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
 
-        # object input
-        track_id = str(getattr(obj, "track_id", "")).strip()
-        if not track_id:
-            raise ValueError("TagStore.upsert: row missing track_id")
-
-        provider = getattr(obj, "provider", None)
-        if provider is None:
-            provider = getattr(obj, "source", None)
-        if provider is None:
-            provider = getattr(obj, "model_id", None)
-        if provider is None:
-            provider = getattr(obj, "tagger", None)
-        provider = str(provider).strip() if provider is not None else "heuristic"
-        if not provider:
-            provider = "heuristic"
-
-        tags_val = getattr(obj, "tags", None)
-        if tags_val is None:
-            # many bundles expose to_dict()
-            to_dict = getattr(obj, "to_dict", None)
-            if callable(to_dict):
-                try:
-                    tags_val = to_dict()
-                except Exception:
-                    tags_val = {"track_id": track_id}
-            else:
-                # last resort: best-effort repr
-                tags_val = {"track_id": track_id}
-
-        if not isinstance(tags_val, dict):
-            tags_val = {"value": tags_val}
-
-        updated_at = getattr(obj, "updated_at", None)
-        if updated_at is None:
-            updated_at = getattr(obj, "created_at", None)
-        if updated_at is None:
-            updated_at = time.time()
-
-        return TagRow(track_id=track_id, provider=provider, tags=tags_val, updated_at=float(updated_at))
+        out: Dict[str, Any] = {}
+        for r in rows:
+            tid = r["track_id"]
+            data = json.loads(r["payload_json"])
+            try:
+                from musicrec.tagging.schema import TrackTagBundle  # type: ignore
+                out[tid] = TrackTagBundle.from_dict(data)
+            except Exception:
+                out[tid] = data
+        return out
