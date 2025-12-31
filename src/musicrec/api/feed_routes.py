@@ -187,6 +187,7 @@ def _safe_row_to_payload(row: Any) -> Tuple[Dict[str, Any], Optional[str], float
     except Exception:
         return dict(tags), (str(provider) if provider is not None else None), 0.0
 
+    return ids, total_items_seen
 
 def _join_tags_into_sections(
     sections: Dict[str, list],
@@ -214,12 +215,11 @@ def _join_tags_into_sections(
     unique_found = len(found_map)
 
     tagged_items = 0
-    missing_items = 0
+    out_sections: Dict[str, Any] = {}
 
-    out: Dict[str, list] = {}
-    for k, items in sections.items():
+    for rail, items in (sections or {}).items():
         if not isinstance(items, list):
-            out[k] = items
+            out_sections[rail] = items
             continue
 
         new_items: list = []
@@ -240,6 +240,10 @@ def _join_tags_into_sections(
             if missing:
                 missing_items += 1
             else:
+                it2["tags"] = tags
+                it2["tags_missing"] = False
+                it2["tags_provider"] = provider
+                it2["tags_updated_at"] = updated_at
                 tagged_items += 1
 
             new_it = dict(it)
@@ -249,7 +253,21 @@ def _join_tags_into_sections(
             new_it["tags_updated_at"] = float(updated_at)
             new_items.append(new_it)
 
-        out[k] = new_items
+def _maybe_apply_reorder_only_personalization(
+    *,
+    sections: Dict[str, list],
+    user_id: Optional[str],
+    store: FeedbackStore,
+    debug: bool,
+) -> Tuple[Dict[str, list], Dict[str, Any]]:
+    """
+    v1.5.6 Step 1.4/1.5:
+      - reorder only (never changes set sizes)
+      - applied only when user_id is present
+      - debug dict is returned only when debug=True
+    """
+    if not user_id:
+        return sections, {}
 
     dbg = {
         "tracks_requested": int(tracks_requested),
@@ -348,11 +366,7 @@ def feed_home(
 
     # 1) Suppression (dislike/skip)
     if user_id:
-        suppressed = store.suppressed_track_ids(
-            user_id=user_id,
-            event_types=("dislike", "skip"),
-            days=365,
-        )
+        suppressed = store.suppressed_track_ids(user_id=user_id, event_types=("dislike", "skip"), days=365)
         before = sections
         sections = _apply_suppression(sections, suppressed)
         removed_by_section = _suppression_removed_counts(before, sections)
@@ -378,10 +392,7 @@ def feed_home(
     if debug:
         d = dict(dbg or {})
         d.setdefault("fallback_used", {})
-        d.setdefault(
-            "sections_returned",
-            {k: int(len(v)) for k, v in sections.items() if isinstance(v, list)},
-        )
+        d.setdefault("sections_returned", {k: int(len(v)) for k, v in sections.items() if isinstance(v, list)})
 
         if user_id:
             d["disliked_suppressed_count"] = int(len(suppressed))
@@ -409,12 +420,18 @@ def feed_genre(
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
     store: FeedbackStore = Depends(get_feedback_store),
 ) -> Dict[str, Any]:
+    """
+    v1.5.6 Step 1.5:
+      - Apply reorder-only personalization to the genre feed as well
+      - Suppression is applied the same way as /feed/home
+    """
     feeds = _get_feeds_engine()
 
     if not genre or not genre.strip():
         raise HTTPException(status_code=400, detail="genre is required")
 
-    q = FeedQuery(country=country, genre=genre.strip(), n=n, explicit_ok=explicit_ok, debug=debug)
+    g = genre.strip()
+    q = FeedQuery(country=country, genre=g, n=n, explicit_ok=explicit_ok, debug=debug)
     sections, dbg = feeds.genre_feed(q)
 
     user_id = _clean_user_id(x_user_id)
@@ -446,7 +463,7 @@ def feed_genre(
     body: Dict[str, Any] = {
         "ok": True,
         "country": country,
-        "genre": genre.strip(),
+        "genre": g,
         "n": int(n),
         "sections": sections,
     }
@@ -462,6 +479,8 @@ def feed_genre(
             d["suppressed_ids_n"] = int(len(suppressed))
             d["suppressed_event_types"] = ["dislike", "skip"]
             d["personalization"] = personalization_dbg
+            if personalization_dbg:
+                d["personalization"] = personalization_dbg
 
         if include_tags:
             d["tags_join"] = tags_join_dbg
