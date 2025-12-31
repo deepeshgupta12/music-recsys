@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
@@ -344,6 +344,116 @@ def _strip_tag_fields_from_items(items: List[Any]) -> List[Any]:
     return out
 
 
+def _extract_multi(tags: Dict[str, Any], keys: List[str]) -> List[str]:
+    out: List[str] = []
+    for k in keys:
+        v = tags.get(k)
+        if v is None:
+            continue
+        if isinstance(v, str):
+            x = v.strip()
+            if x:
+                out.append(x)
+        elif isinstance(v, list):
+            for it in v:
+                if isinstance(it, str):
+                    x = it.strip()
+                    if x:
+                        out.append(x)
+    return out
+
+
+def _mood_counts_from_store(
+    store: TagStore,
+    *,
+    max_rows: int = 5000,
+    provider: Optional[str] = None,
+) -> Tuple[Dict[str, int], int]:
+    """
+    Best-effort sqlite scan (same approach as /tags/filters):
+      - reads tags_json/payload_json from TagStore sqlite table
+      - extracts moods/scenes
+    Returns: (mood_counts, rows_scanned)
+    """
+    mood_keys = ["moods", "mood", "scenes", "scene"]
+    mood_counts: Dict[str, int] = {}
+    rows_scanned = 0
+
+    connect = getattr(store, "_connect", None)
+    cfg = getattr(store, "cfg", None)
+    if connect is None or cfg is None:
+        return {}, 0
+
+    table_name = getattr(cfg, "table_name", None) or getattr(cfg, "table", None) or "track_tags"
+    prov = (provider or "").strip() or None
+
+    try:
+        with connect() as con:
+            cols: List[str] = []
+            try:
+                cols = [r["name"] for r in con.execute(f"PRAGMA table_info({table_name})").fetchall()]
+            except Exception:
+                cols = []
+
+            tags_col = "tags_json" if "tags_json" in cols else ("payload_json" if "payload_json" in cols else None)
+            prov_col = "provider" if "provider" in cols else None
+            if tags_col is None:
+                return {}, 0
+
+            where = ""
+            params: List[Any] = []
+            if prov and prov_col:
+                where = f" WHERE {prov_col} = ?"
+                params.append(prov)
+
+            limit_sql = f" LIMIT {int(max_rows)}" if int(max_rows) > 0 else ""
+            q = f"SELECT {tags_col} FROM {table_name}{where}{limit_sql}"
+            rows = con.execute(q, tuple(params)).fetchall()
+
+            import json
+
+            for r in rows:
+                rows_scanned += 1
+                raw = r.get(tags_col)
+                if not raw:
+                    continue
+                try:
+                    tags = json.loads(raw) if isinstance(raw, str) else {}
+                except Exception:
+                    tags = {}
+                if not isinstance(tags, dict):
+                    continue
+
+                vals = _extract_multi(tags, mood_keys)
+                for v in vals:
+                    slug = _slugify(v)
+                    if not slug:
+                        continue
+                    mood_counts[slug] = mood_counts.get(slug, 0) + 1
+    except Exception:
+        return mood_counts, rows_scanned
+
+    return mood_counts, rows_scanned
+
+
+def _pick_top_moods(
+    store: TagStore,
+    *,
+    limit: int,
+    max_rows: int = 5000,
+    provider: Optional[str] = None,
+) -> Tuple[List[str], Dict[str, int], int]:
+    """
+    Returns:
+      - top mood slugs (sorted by count desc)
+      - mood_counts map
+      - rows_scanned
+    """
+    mood_counts, rows_scanned = _mood_counts_from_store(store, max_rows=max_rows, provider=provider)
+    top = sorted(mood_counts.items(), key=lambda kv: (-int(kv[1]), kv[0]))[: int(limit)]
+    return [k for k, _ in top], mood_counts, int(rows_scanned)
+
+
 def _stable_candidates_from_sections(sections_with_tags: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Stable order:
@@ -383,6 +493,11 @@ def _dedup_items_by_track_id(items: List[Dict[str, Any]], limit: int) -> List[Di
     return out
 
 
+def _fallback_mood_slugs() -> List[str]:
+    # Deterministic defaults: UX rails should exist even if tag DB coverage is low.
+    return ["focus", "chill", "party", "gym", "late-night", "study", "calm", "energetic", "everyday"]
+
+
 @router.get("/feed/home")
 def feed_home(
     country: str = Query(...),
@@ -391,6 +506,10 @@ def feed_home(
     debug: bool = Query(default=False),
     include_tags: bool = Query(default=False),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    mood_rails: bool = Query(default=False),
+    moods_k: int = Query(default=3, ge=1, le=8),
+    mood_rail_n: int = Query(default=10, ge=3, le=30),
+    mood_pool_mult: int = Query(default=10, ge=2, le=50),
     store: FeedbackStore = Depends(get_feedback_store),
 ) -> Dict[str, Any]:
     feeds = _get_feeds_engine()
@@ -421,13 +540,17 @@ def feed_home(
             config=cfg,
         )
 
+    # Optionally join tags for the base sections
     tags_join_dbg: Dict[str, Any] = {}
     if include_tags:
         tag_store = _get_tag_store()
         sections, tags_join_dbg = _join_tags_into_sections(sections, tag_store, debug=bool(debug))
 
+    # Base response
     body: Dict[str, Any] = {"ok": True, "country": country, "n": int(n), "sections": sections}
 
+    # Debug skeleton
+    d: Dict[str, Any] = {}
     if debug:
         d = dict(dbg or {})
         d.setdefault("fallback_used", {})
@@ -443,6 +566,96 @@ def feed_home(
         if include_tags:
             d["tags_join"] = tags_join_dbg
 
+    # ---------- Step 4D: mood rails on home ----------
+    if mood_rails:
+        tag_store = _get_tag_store()
+
+        # Select moods from tag facets
+        moods, mood_counts, rows_scanned = _pick_top_moods(
+            tag_store,
+            limit=int(moods_k),
+            max_rows=5000,
+            provider=None,
+        )
+
+        moods_source = "facets"
+        fallback_used = False
+        fallback_moods_used: List[str] = []
+
+        if not moods:
+            fb = _fallback_mood_slugs()
+            moods = fb[: int(moods_k)]
+            moods_source = "fallback_list"
+            fallback_used = True
+            fallback_moods_used = list(moods)
+
+        # Build a candidate pool (bigger than n)
+        pool_n = min(200, max(int(mood_rail_n) * int(mood_pool_mult), 25))
+        q2 = FeedQuery(country=country, genre=None, n=pool_n, explicit_ok=explicit_ok, debug=debug)
+        pool_sections, _ = feeds.home_feed(q2)
+
+        # Apply same suppression/personalization to candidate pool
+        if user_id:
+            pool_sections = _apply_suppression(pool_sections, suppressed)
+            recent = store.recent_events(user_id=user_id, limit=500)
+            cfg = PersonalizationConfig()
+            pool_sections, _ = reorder_only_personalize_sections(
+                sections=pool_sections,
+                recent_events=recent,
+                user_id=user_id,
+                debug=False,  # don't bloat home debug
+                config=cfg,
+            )
+
+        # Always join tags internally for filtering mood rails
+        pool_with_tags, pool_tags_dbg = _join_tags_into_sections(pool_sections, tag_store, debug=bool(debug))
+
+        # Flatten candidate list in stable order
+        candidates = _stable_candidates_from_sections(pool_with_tags)
+
+        mood_sections_added: Dict[str, int] = {}
+        used_track_ids: set[str] = set()
+
+        for mslug in moods:
+            out_items: List[Dict[str, Any]] = []
+            for it in candidates:
+                tid = (it.get("track_id") or "").strip()
+                if not tid or tid in used_track_ids:
+                    continue
+                if _item_has_mood(it, mslug):
+                    used_track_ids.add(tid)
+                    out_items.append(it)
+                if len(out_items) >= int(mood_rail_n):
+                    break
+
+            # If include_tags=false, strip tag fields for the mood rail items
+            final_items: List[Any] = out_items
+            if not include_tags:
+                final_items = _strip_tag_fields_from_items(final_items)
+
+            sections[f"mood__{mslug}"] = final_items
+            mood_sections_added[mslug] = int(len(out_items))
+
+        # Ensure response uses mutated sections
+        body["sections"] = sections
+
+        if debug:
+            d["mood_rails"] = {
+                "enabled": True,
+                "moods_selected": moods,
+                "moods_source": moods_source,
+                "fallback_used": bool(fallback_used),
+                "fallback_moods_used": fallback_moods_used,
+                "mood_counts_selected": {m: int(mood_counts.get(m, 0)) for m in moods} if moods_source == "facets" else {},
+                "rows_scanned": int(rows_scanned),
+                "pool_n": int(pool_n),
+                "mood_rail_n": int(mood_rail_n),
+                "moods_k": int(moods_k),
+                "pool_tags_join": pool_tags_dbg,
+                "sections_added": mood_sections_added,
+            }
+
+    if debug:
         body["debug"] = d
 
     return body
