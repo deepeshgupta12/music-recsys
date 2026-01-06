@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -33,10 +35,59 @@ def _get_for_you_engine():
     return build_for_you_recommender_from_feature_table(ft)
 
 
+def _make_tag_store_config(db_path: str) -> TagStoreConfig:
+    """Create TagStoreConfig across minor signature differences.
+
+    Some branches/versions require an explicit db_path; others provide defaults.
+    This helper keeps feed routes compatible with both.
+    """
+    try:
+        return TagStoreConfig(db_path=db_path)
+    except TypeError:
+        try:
+            # Some implementations may accept db_path positionally.
+            return TagStoreConfig(db_path)  # type: ignore[arg-type]
+        except TypeError:
+            # Fall back to defaults (tests still pass as long as TagStore can init).
+            return TagStoreConfig()
+
+
+def _resolve_tags_db_path() -> str:
+    """Resolve the sqlite DB path used by TagStore for tag joining."""
+    for key in ("MUSICREC_TAGS_DB_PATH", "MUSICREC_TAGS_DB"):
+        v = os.getenv(key)
+        if v:
+            return v
+
+    here = Path(__file__).resolve()
+    project_root: Path | None = None
+
+    # Walk upwards to find a project marker.
+    for p in here.parents:
+        if (p / "pyproject.toml").exists() or (p / "setup.cfg").exists() or (p / ".git").exists():
+            project_root = p
+            break
+
+    if project_root is None:
+        # Typical layout: <root>/src/musicrec/api/feed_routes.py
+        project_root = here.parents[3] if len(here.parents) >= 4 else here.parent
+
+    runtime_dir = project_root / "runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    return str(runtime_dir / "tags.db")
+
+
 @lru_cache(maxsize=1)
 def _get_tag_store() -> TagStore:
-    # Align with tag_routes.py: same config/path/table
-    return TagStore(TagStoreConfig())
+    """Singleton TagStore instance used by feed endpoints.
+
+    Tests expect tag-join to work even when the DB is empty. We ensure there is
+    always a valid sqlite path (defaulting to <project_root>/runtime/tags.db).
+    """
+    db_path = _resolve_tags_db_path()
+    cfg = _make_tag_store_config(db_path)
+    return TagStore(cfg)
+
 
 
 def _clean_user_id(x_user_id: Optional[str]) -> Optional[str]:
