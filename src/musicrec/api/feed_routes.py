@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
+from urllib import request as request
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+import os
 
 from musicrec.api.feedback_routes import get_feedback_store
 from musicrec.feeds import FeedQuery, SegmentFeeds
@@ -19,6 +22,10 @@ from musicrec.storage.feedback_store import FeedbackStore
 from musicrec.storage.tag_store import TagStore, TagStoreConfig
 
 router = APIRouter(tags=["feeds"])
+TAGS_DB_PATH = "runtime/tags.db"
+TAGS_TABLE_NAME = "track_tags"
+_TAG_STORE_SINGLETON: Optional[TagStore] = None
+
 
 
 @lru_cache(maxsize=1)
@@ -32,11 +39,54 @@ def _get_for_you_engine():
     ft = load_feature_table()
     return build_for_you_recommender_from_feature_table(ft)
 
+def _default_tag_db_path() -> str:
+    # Prefer env var if present (works well for tests + local)
+    p = os.getenv("MUSICREC_TAG_DB_PATH") or os.getenv("TAG_DB_PATH")
+    if p:
+        return p
+
+    # Fall back to repo-local data path
+    # Adjust if your repo layout differs, but this is a safe default.
+    repo_root = Path(__file__).resolve().parents[3]
+    data_dir = repo_root / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return str(data_dir / "tag_store.sqlite3")
+
+
+def _make_tag_store():
+    # TagStoreConfig requires db_path
+    return TagStore(TagStoreConfig(db_path=_default_tag_db_path()))
+
 
 @lru_cache(maxsize=1)
-def _get_tag_store() -> TagStore:
-    # Align with tag_routes.py: same config/path/table
-    return TagStore(TagStoreConfig())
+def _get_tag_store(request: Any = None) -> "TagStore":
+    """
+    Robust tag store getter.
+
+    - If a real FastAPI Request is passed, prefer request.app.state.tag_store
+    - Otherwise fallback to a module-level singleton
+    """
+    global _TAG_STORE_SINGLETON
+
+    # Try request.app.state if request looks like a Starlette/FastAPI Request
+    try:
+        app = getattr(request, "app", None)
+        state = getattr(app, "state", None) if app is not None else None
+        if state is not None:
+            st = getattr(state, "tag_store", None)
+            if st is not None:
+                return st
+
+            st = _make_tag_store()
+            state.tag_store = st
+            return st
+    except Exception:
+        pass
+
+    # Fallback singleton
+    if _TAG_STORE_SINGLETON is None:
+        _TAG_STORE_SINGLETON = _make_tag_store()
+    return _TAG_STORE_SINGLETON
 
 
 def _clean_user_id(x_user_id: Optional[str]) -> Optional[str]:
@@ -551,6 +601,7 @@ def _dedup_items_by_track_id(items: List[Dict[str, Any]], limit: int, exclude: O
 @router.get("/feed/home")
 def feed_home(
     country: str = Query(...),
+    request: str = Request,
     n: int = Query(default=10, ge=1, le=200),
     explicit_ok: bool = Query(default=False),
     debug: bool = Query(default=False),
@@ -562,6 +613,7 @@ def feed_home(
     mood_pool_mult: int = Query(default=10, ge=2, le=50),
     store: FeedbackStore = Depends(get_feedback_store),
 ) -> Dict[str, Any]:
+    tag_store = _get_tag_store(request)
     feeds = _get_feeds_engine()
 
     q = FeedQuery(country=country, genre=None, n=n, explicit_ok=explicit_ok, debug=debug)
@@ -597,13 +649,13 @@ def feed_home(
     # Optional: include tags in the "main" rails
     tags_join_dbg: Dict[str, Any] = {}
     if include_tags:
-        tag_store = _get_tag_store()
+        tag_store = _get_tag_store(request)
         sections, tags_join_dbg = _join_tags_into_sections(sections, tag_store, debug=bool(debug))
 
     # --- Mood rails (Step 4D) ---
     mood_rails_dbg: Dict[str, Any] = {}
     if mood_rails:
-        tag_store = _get_tag_store()
+        tag_store = _get_tag_store(request)
 
         moods, mood_counts, rows_scanned = _pick_top_moods(
             tag_store,
@@ -729,6 +781,7 @@ def feed_home(
 @router.get("/feed/genre")
 def feed_genre(
     country: str = Query(...),
+    request: str = Request,
     genre: str = Query(...),
     n: int = Query(default=10, ge=1, le=200),
     explicit_ok: bool = Query(default=False),
@@ -768,7 +821,7 @@ def feed_genre(
 
     tags_join_dbg: Dict[str, Any] = {}
     if include_tags:
-        tag_store = _get_tag_store()
+        tag_store = _get_tag_store(request)
         sections, tags_join_dbg = _join_tags_into_sections(sections, tag_store, debug=bool(debug))
 
     body: Dict[str, Any] = {
@@ -802,6 +855,7 @@ def feed_genre(
 @router.get("/feed/mood")
 def feed_mood(
     country: str = Query(...),
+    request: str = Request,
     mood: str = Query(..., description="Mood/scene slug, e.g. late-night-chill"),
     n: int = Query(default=10, ge=1, le=200),
     explicit_ok: bool = Query(default=False),
@@ -850,7 +904,7 @@ def feed_mood(
             config=cfg,
         )
 
-    tag_store = _get_tag_store()
+    tag_store = _get_tag_store(request)
     sections_with_tags, tags_join_dbg = _join_tags_into_sections(sections, tag_store, debug=bool(debug))
     candidates = _stable_candidates_from_sections(sections_with_tags)
 
@@ -916,6 +970,7 @@ def feed_mood(
 @router.get("/feed/for-you")
 def feed_for_you(
     country: str = Query(...),
+    request: str = Request,
     n: int = Query(default=10, ge=5, le=200),
     explicit_ok: bool = Query(default=False),
     debug: bool = Query(default=False),
@@ -1002,7 +1057,7 @@ def feed_for_you(
 
     tags_join_dbg: Dict[str, Any] = {}
     if include_tags:
-        tag_store = _get_tag_store()
+        tag_store = _get_tag_store(request)
         sections, tags_join_dbg = _join_tags_into_sections(sections, tag_store, debug=bool(debug))
 
     body: Dict[str, Any] = {"ok": True, "country": country, "n": int(n), "sections": sections}
